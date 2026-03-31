@@ -228,6 +228,7 @@ cmd_audit() {
 
 cmd_enforce() {
   local check_only=false
+  local violations=0
   
   if [[ "${1:-}" == "--check" ]]; then
     check_only=true
@@ -241,43 +242,164 @@ cmd_enforce() {
     return 1
   fi
   
-  # TODO: Implement actual constraint checking
-  # For now, just show what would be checked
+  # Check for circular dependencies (if madge is available)
+  if command -v madge &> /dev/null; then
+    info "Checking for circular dependencies..."
+    if madge --circular "$PROJECT_ROOT/src" 2>/dev/null | grep -q "Circular"; then
+      error "Circular dependencies found"
+      violations=$((violations + 1))
+    else
+      success "No circular dependencies"
+    fi
+  fi
   
-  success "Architecture constraints check passed"
+  # Check file sizes
+  info "Checking file sizes..."
+  local large_files=$(find "$PROJECT_ROOT/src" -name "*.ts" -o -name "*.js" 2>/dev/null | while read -r file; do
+    local lines=$(wc -l < "$file")
+    if [[ $lines -gt 500 ]]; then
+      echo "$file ($lines lines)"
+    fi
+  done)
+  
+  if [[ -n "$large_files" ]]; then
+    warn "Large files found (>500 lines):"
+    echo "$large_files" | while read -r line; do
+      echo "  - $line"
+    done
+    violations=$((violations + 1))
+  else
+    success "All files within size limits"
+  fi
+  
+  # Check for unvalidated API calls
+  info "Checking for unvalidated API calls..."
+  local unvalidated=$(grep -r "\.json()" "$PROJECT_ROOT/src" 2>/dev/null | grep -v "parse\|validate\|schema" | wc -l)
+  if [[ $unvalidated -gt 0 ]]; then
+    warn "Found $unvalidated potential unvalidated API calls"
+    info "Consider using Zod schemas for validation"
+    violations=$((violations + 1))
+  else
+    success "API calls appear to be validated"
+  fi
+  
+  echo ""
+  if [[ $violations -eq 0 ]]; then
+    success "Architecture constraints check passed ✓"
+  else
+    error "Found $violations constraint violations"
+    if [[ "$check_only" == false ]]; then
+      info "Run with --check to see violations without making changes"
+    fi
+    return 1
+  fi
   
   if [[ "$check_only" == false ]]; then
     info "Generating enforcement rules..."
-    # TODO: Generate ESLint rules, structural tests, etc.
+    
+    # Generate ESLint rule for file size
+    if [[ ! -f "$PROJECT_ROOT/.eslintrc.json" ]]; then
+      cat > "$PROJECT_ROOT/.eslintrc.json" << 'EOESLINT'
+{
+  "rules": {
+    "max-lines": ["warn", 500],
+    "max-lines-per-function": ["warn", 50],
+    "complexity": ["warn", 10]
+  }
+}
+EOESLINT
+      success "Generated .eslintrc.json"
+    fi
+    
     success "Enforcement rules generated"
   fi
 }
 
 cmd_garden() {
   local mode="${1:---all}"
+  local issues_found=0
   
   info "Running garden cleanup ($mode)..."
   
-  # TODO: Implement actual cleanup logic
-  # For now, just show what would be cleaned
-  
   if [[ "$mode" == "--docs-only" ]] || [[ "$mode" == "--all" ]]; then
     info "Scanning documentation..."
-    # Check for broken links, outdated content, etc.
-    success "Documentation scan complete"
+    
+    # Check for broken links in markdown files
+    if [[ -d "$PROJECT_ROOT/docs" ]]; then
+      local broken_links=$(find "$PROJECT_ROOT/docs" -name "*.md" -exec grep -H '\[.*\](.*)' {} \; 2>/dev/null | \
+        grep -v 'http' | \
+        while read -r line; do
+          local file=$(echo "$line" | cut -d: -f1)
+          local link=$(echo "$line" | sed -n 's/.*\[\(.*\)\](\(.*\)).*/\2/p')
+          if [[ -n "$link" ]] && [[ ! -f "$PROJECT_ROOT/$link" ]]; then
+            echo "$file: broken link to $link"
+          fi
+        done)
+      
+      if [[ -n "$broken_links" ]]; then
+        warn "Broken links found:"
+        echo "$broken_links" | while read -r line; do
+          echo "  - $line"
+        done
+        issues_found=$((issues_found + 1))
+      else
+        success "No broken links in documentation"
+      fi
+      
+      # Check for outdated docs (not modified in 90 days)
+      local old_docs=$(find "$PROJECT_ROOT/docs" -name "*.md" -mtime +90 2>/dev/null)
+      if [[ -n "$old_docs" ]]; then
+        warn "Documentation not updated in 90+ days:"
+        echo "$old_docs" | while read -r file; do
+          echo "  - $(basename "$file")"
+        done
+        issues_found=$((issues_found + 1))
+      else
+        success "Documentation is up to date"
+      fi
+    fi
   fi
   
   if [[ "$mode" == "--code-only" ]] || [[ "$mode" == "--all" ]]; then
     info "Scanning code..."
-    # Check for duplicates, unused exports, etc.
-    success "Code scan complete"
+    
+    # Check for duplicate code patterns
+    if [[ -d "$PROJECT_ROOT/src" ]]; then
+      # Look for common duplicate patterns
+      local duplicate_functions=$(grep -r "^function \(debounce\|throttle\|formatDate\)" "$PROJECT_ROOT/src" 2>/dev/null | wc -l)
+      if [[ $duplicate_functions -gt 1 ]]; then
+        warn "Found $duplicate_functions duplicate utility functions"
+        info "Consider extracting to shared utils package"
+        issues_found=$((issues_found + 1))
+      else
+        success "No obvious duplicate functions"
+      fi
+      
+      # Check for unused exports
+      if command -v ts-prune &> /dev/null; then
+        local unused=$(ts-prune "$PROJECT_ROOT" 2>/dev/null | grep -c "used in module")
+        if [[ $unused -gt 0 ]]; then
+          warn "Found $unused potentially unused exports"
+          issues_found=$((issues_found + 1))
+        else
+          success "No unused exports detected"
+        fi
+      fi
+    fi
   fi
   
-  success "Garden cleanup complete"
+  echo ""
+  if [[ $issues_found -eq 0 ]]; then
+    success "Garden cleanup complete - no issues found ✓"
+  else
+    warn "Found $issues_found issues that need attention"
+    info "Consider creating PRs to fix these issues"
+  fi
 }
 
 cmd_golden_rules() {
   local check_only=false
+  local violations=0
   
   if [[ "${1:-}" == "--check" ]]; then
     check_only=true
@@ -285,15 +407,78 @@ cmd_golden_rules() {
   
   info "Checking golden rules..."
   
-  # TODO: Implement actual golden rules checking
-  # For now, just show what would be checked
+  if [[ ! -d "$PROJECT_ROOT/src" ]]; then
+    warn "No src directory found, skipping code checks"
+    return 0
+  fi
   
-  success "Golden rules check passed"
+  # Rule 1: Shared utilities
+  info "Checking for inline utility functions..."
+  local inline_utils=$(grep -r "^function \(debounce\|throttle\|formatDate\|parseJSON\)" "$PROJECT_ROOT/src" 2>/dev/null)
+  if [[ -n "$inline_utils" ]]; then
+    warn "Found inline utility functions:"
+    echo "$inline_utils" | while read -r line; do
+      echo "  - $line"
+    done
+    info "→ Extract to shared utils package"
+    violations=$((violations + 1))
+  else
+    success "No inline utility functions found"
+  fi
   
-  if [[ "$check_only" == false ]]; then
-    info "Applying golden rules refactoring..."
-    # TODO: Apply refactoring
-    success "Golden rules applied"
+  # Rule 2: Boundary validation
+  info "Checking for unvalidated API responses..."
+  local unvalidated=$(grep -r "\.json()" "$PROJECT_ROOT/src" 2>/dev/null | grep -v "parse\|validate\|schema")
+  if [[ -n "$unvalidated" ]]; then
+    warn "Found unvalidated API responses:"
+    echo "$unvalidated" | head -5 | while read -r line; do
+      echo "  - $line"
+    done
+    info "→ Use Zod schemas for validation"
+    violations=$((violations + 1))
+  else
+    success "API responses appear to be validated"
+  fi
+  
+  # Rule 3: Typed SDKs
+  info "Checking for manual API requests..."
+  local manual_requests=$(grep -r "axios\.post\|fetch(" "$PROJECT_ROOT/src" 2>/dev/null | wc -l)
+  if [[ $manual_requests -gt 5 ]]; then
+    warn "Found $manual_requests manual API requests"
+    info "→ Consider using generated API client"
+    violations=$((violations + 1))
+  else
+    success "API requests look reasonable"
+  fi
+  
+  # Rule 4: Magic numbers
+  info "Checking for magic numbers..."
+  local magic_numbers=$(grep -r "setTimeout\|setInterval" "$PROJECT_ROOT/src" 2>/dev/null | grep -E "[0-9]{3,}" | wc -l)
+  if [[ $magic_numbers -gt 0 ]]; then
+    warn "Found $magic_numbers potential magic numbers in timeouts"
+    info "→ Extract to named constants"
+    violations=$((violations + 1))
+  else
+    success "No obvious magic numbers"
+  fi
+  
+  echo ""
+  if [[ $violations -eq 0 ]]; then
+    success "Golden rules check passed ✓"
+  else
+    warn "Found $violations golden rule violations"
+    
+    if [[ "$check_only" == false ]]; then
+      info ""
+      info "To fix these issues:"
+      info "  1. Extract inline utilities to src/utils/"
+      info "  2. Add Zod schemas for API validation"
+      info "  3. Consider generating API client from OpenAPI spec"
+      info "  4. Extract magic numbers to constants"
+      info ""
+      info "Run with --check to see violations without suggestions"
+    fi
+    return 1
   fi
 }
 
