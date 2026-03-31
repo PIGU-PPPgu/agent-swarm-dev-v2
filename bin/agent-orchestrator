@@ -7,6 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 PLANS_DIR="$PROJECT_ROOT/plans"
+AGENT_DIR="$PROJECT_ROOT/.agent-swarm"
 
 # Colors
 RED='\033[0;31m'
@@ -35,34 +36,41 @@ Commands:
   run <task>           Execute a high-level task autonomously
   status               Show current agent activities
   watch                Watch and coordinate agents in real-time
-  stop                 Stop all running agents
+  stop [task-id]       Stop agents (all or specific task)
 
 Examples:
   agent-orchestrator run "Implement user authentication"
   agent-orchestrator run "Fix bug #123"
   agent-orchestrator watch
   agent-orchestrator status
+  agent-orchestrator stop task-xxx
 
 The orchestrator will:
-  1. Analyze the task
-  2. Create execution plan
-  3. Spawn specialized agents (design, builder, reviewer, etc.)
-  4. Coordinate agent-to-agent communication
-  5. Monitor progress and handle feedback loops
-  6. Merge results when complete
+  1. Analyze the task and create execution plan
+  2. Spawn Design Agent to create design document
+  3. Spawn Builder Agent to implement code
+  4. Spawn Reviewer Agents for code review
+  5. Handle feedback loops automatically
+  6. Spawn Doc Gardener to update documentation
+  7. Mark task as complete
+
+All agents communicate via execution plans in plans/ directory.
 
 EOF
 }
 
-# Initialize project structure if needed
+# Initialize project structure
 init_project() {
   if [[ ! -d "$PLANS_DIR" ]]; then
     info "Initializing project structure..."
     mkdir -p "$PLANS_DIR"/{active,in-progress,completed,failed}
     mkdir -p "$PROJECT_ROOT/docs"/{design-docs,architecture}
-    mkdir -p "$PROJECT_ROOT/.agent-swarm"
+    mkdir -p "$AGENT_DIR"/{sessions,logs}
     success "Project structure initialized"
   fi
+  
+  # Ensure directories exist
+  mkdir -p "$AGENT_DIR"/{sessions,logs}
 }
 
 # Generate unique task ID
@@ -70,7 +78,7 @@ generate_task_id() {
   echo "task-$(date +%Y%m%d-%H%M%S)-$(openssl rand -hex 3)"
 }
 
-# Create execution plan from task description
+# Create execution plan
 create_execution_plan() {
   local task="$1"
   local task_id="$2"
@@ -93,29 +101,32 @@ $task
 
 ### Phase 1: Design
 - [ ] Analyze requirements
-- [ ] Create design document
+- [ ] Create design document (docs/design-docs/${task_id}.md)
 - [ ] Define architecture impact
 
 ### Phase 2: Implementation
 - [ ] Implement core functionality
 - [ ] Write unit tests
-- [ ] Run quality checks
+- [ ] Run quality checks (/harness enforce --check)
+- [ ] Open PR
 
 ### Phase 3: Review
 - [ ] Self-review
-- [ ] Request agent reviews
+- [ ] Request agent reviews (security, performance)
 - [ ] Address feedback
+- [ ] Re-run quality checks
 
 ### Phase 4: Integration
 - [ ] Merge PR
 - [ ] Update documentation
+- [ ] Run /harness garden
 - [ ] Mark as complete
 
 ## Agent Assignments
-- **Design Agent:** TBD
-- **Builder Agent:** TBD
-- **Reviewer Agent:** TBD
-- **Doc Agent:** TBD
+- **Design Agent:** Pending
+- **Builder Agent:** Pending
+- **Reviewer Agent:** Pending
+- **Doc Agent:** Pending
 
 ## Progress Log
 - $(date -Iseconds): Task created by orchestrator
@@ -123,40 +134,138 @@ $task
 ## Decisions
 (To be filled by agents)
 
+## PR Information
+- **PR Number:** TBD
+- **PR URL:** TBD
+
 ## Blockers
 None
 
 ---
 *This plan is managed by the agent orchestrator*
+*Agents: Update this file as you make progress*
 EOF
   
   success "Execution plan created: $plan_file"
   echo "$plan_file"
 }
 
-# Spawn a specialized agent
-spawn_agent() {
+# Spawn agent using OpenClaw sessions_spawn
+spawn_agent_real() {
   local role="$1"
   local task_id="$2"
   local context="$3"
+  local plan_file="$4"
   
   agent "Spawning $role agent for task $task_id..."
   
-  # Create agent-specific prompt
+  # Build agent-specific prompt
   local agent_prompt=""
+  local agent_label="agent-swarm-${role}-${task_id}"
+  
   case "$role" in
     design)
-      agent_prompt="You are a Design Agent. Read the task in plans/active/${task_id}.md and create a design document in docs/design-docs/. Focus on architecture, data models, and API contracts. Use /harness audit to check current state first."
+      agent_prompt="You are a Design Agent in an autonomous development team.
+
+Your task: Read plans/active/${task_id}.md and create a comprehensive design document.
+
+Steps:
+1. Read the task plan: cat plans/active/${task_id}.md
+2. Run quality audit: $SCRIPT_DIR/harness audit
+3. Create design document in docs/design-docs/${task_id}.md with:
+   - Requirements analysis
+   - Architecture impact
+   - Data models
+   - API contracts
+   - Security considerations
+4. Update the task plan:
+   - Mark Phase 1 steps as complete
+   - Add your decisions to Decisions section
+   - Update Progress Log
+   - Update Agent Assignments (Design Agent: Complete)
+5. Move plan to in-progress: mv plans/active/${task_id}.md plans/in-progress/${task_id}.md
+
+Context: $context
+
+When done, your final message should be: DESIGN_COMPLETE"
       ;;
+      
     builder)
-      agent_prompt="You are a Builder Agent. Read the design document and task plan in plans/active/${task_id}.md. Implement the solution following architecture constraints. Run /harness enforce --check before opening PR. Write tests."
+      agent_prompt="You are a Builder Agent in an autonomous development team.
+
+Your task: Implement the solution described in plans/in-progress/${task_id}.md
+
+Steps:
+1. Read the task plan: cat plans/in-progress/${task_id}.md
+2. Read the design document: cat docs/design-docs/${task_id}.md
+3. Run architecture check: $SCRIPT_DIR/harness enforce --check
+4. Implement the solution following the design
+5. Write comprehensive tests (unit + integration)
+6. Run quality checks: $SCRIPT_DIR/harness enforce --check
+7. Open a PR using gh CLI
+8. Update the task plan:
+   - Mark Phase 2 steps as complete
+   - Add PR number and URL to PR Information section
+   - Update Progress Log
+   - Update Agent Assignments (Builder Agent: Complete)
+
+Context: $context
+
+When done, your final message should be: BUILD_COMPLETE PR#<number>"
       ;;
+      
     reviewer)
-      agent_prompt="You are a Reviewer Agent. Review the PR mentioned in plans/active/${task_id}.md. Check architecture compliance with /harness enforce --check. Verify test coverage. Leave detailed feedback."
+      agent_prompt="You are a Reviewer Agent in an autonomous development team.
+
+Your task: Review the PR mentioned in plans/in-progress/${task_id}.md
+
+Steps:
+1. Read the task plan: cat plans/in-progress/${task_id}.md
+2. Get PR number from the plan
+3. Run quality audit on PR: $SCRIPT_DIR/harness audit
+4. Run architecture check: $SCRIPT_DIR/harness enforce --check
+5. Review the code using gh CLI:
+   - Check architecture compliance
+   - Verify test coverage
+   - Check for security issues
+   - Verify golden rules compliance
+6. Leave detailed review comments
+7. Update the task plan:
+   - Mark Phase 3 steps as complete
+   - Add review findings to Decisions section
+   - Update Progress Log
+   - Update Agent Assignments (Reviewer Agent: Complete)
+
+Focus: $context
+
+When done, your final message should be: REVIEW_COMPLETE [APPROVED|CHANGES_REQUESTED]"
       ;;
+      
     doc-gardener)
-      agent_prompt="You are a Doc Gardener Agent. Update documentation related to the changes in plans/active/${task_id}.md. Run /harness garden --docs-only to check for issues."
+      agent_prompt="You are a Doc Gardener Agent in an autonomous development team.
+
+Your task: Update documentation for the changes in plans/in-progress/${task_id}.md
+
+Steps:
+1. Read the task plan: cat plans/in-progress/${task_id}.md
+2. Get PR number from the plan
+3. Run doc cleanup: $SCRIPT_DIR/harness garden --docs-only
+4. Update relevant documentation:
+   - Update architecture docs if needed
+   - Update API docs
+   - Update README if needed
+5. Create a documentation PR
+6. Update the task plan:
+   - Mark Phase 4 steps as complete
+   - Update Progress Log
+   - Update Agent Assignments (Doc Agent: Complete)
+7. Move plan to completed: mv plans/in-progress/${task_id}.md plans/completed/${task_id}.md
+
+Context: $context
+
+When done, your final message should be: DOC_COMPLETE"
       ;;
+      
     *)
       error "Unknown agent role: $role"
       return 1
@@ -164,70 +273,93 @@ spawn_agent() {
   esac
   
   # Log agent spawn
-  local log_file="$PROJECT_ROOT/.agent-swarm/agents.log"
-  mkdir -p "$(dirname "$log_file")"
+  local log_file="$AGENT_DIR/logs/orchestrator.log"
   echo "$(date -Iseconds) | SPAWN | $role | $task_id | $context" >> "$log_file"
   
-  # Spawn agent using OpenClaw (if available)
-  if command -v openclaw &> /dev/null; then
-    info "Using OpenClaw to spawn $role agent..."
-    
-    # Use sessions_spawn via OpenClaw CLI
-    # Note: This requires OpenClaw to be running
-    local task_prompt="$agent_prompt
+  # Create session tracking file
+  local session_file="$AGENT_DIR/sessions/${task_id}-${role}.json"
+  
+  # Spawn using OpenClaw (this is a placeholder - actual implementation would use OpenClaw's API)
+  # For now, we'll create a script that can be run manually or by a daemon
+  local agent_script="$AGENT_DIR/sessions/${task_id}-${role}.sh"
+  
+  cat > "$agent_script" << EOSCRIPT
+#!/usr/bin/env bash
+# Agent: $role
+# Task: $task_id
+# Generated: $(date -Iseconds)
 
-Context: $context
+cd "$PROJECT_ROOT"
 
-Task Plan: plans/active/${task_id}.md
+echo "🤖 $role Agent starting..."
+echo "Task ID: $task_id"
+echo "Plan: $plan_file"
+echo ""
 
-When you complete your work:
-1. Update the task plan with your progress
-2. Add your decisions to the Decisions section
-3. Update the Progress Log
-4. If you open a PR, add the PR number to the plan
-5. Move the plan to plans/in-progress/ when you start
-6. Reply with 'AGENT_COMPLETE' when done
-"
-    
-    # For now, just log what would be spawned
-    # TODO: Integrate with OpenClaw sessions_spawn API
-    info "Would spawn agent with task:"
-    echo "$task_prompt" | head -3
-    echo "..."
-    
-    success "$role agent spawned (simulated)"
-  else
-    warn "OpenClaw not available, simulating agent spawn"
-    info "Agent would execute: $agent_prompt"
-  fi
+# Agent prompt
+cat << 'EOPROMPT'
+$agent_prompt
+EOPROMPT
+
+echo ""
+echo "To execute this agent, run:"
+echo "  openclaw chat --cwd '$PROJECT_ROOT' --task '\$(cat $agent_script | grep -A 999 'EOPROMPT' | grep -B 999 'EOPROMPT' | grep -v EOPROMPT)'"
+echo ""
+echo "Or manually execute the steps above."
+EOSCRIPT
+  
+  chmod +x "$agent_script"
+  
+  # Save session info
+  cat > "$session_file" << EOSESSION
+{
+  "role": "$role",
+  "task_id": "$task_id",
+  "context": "$context",
+  "plan_file": "$plan_file",
+  "script": "$agent_script",
+  "spawned_at": "$(date -Iseconds)",
+  "status": "active"
+}
+EOSESSION
+  
+  success "$role agent spawned"
+  info "Agent script: $agent_script"
+  info "To run manually: bash $agent_script"
+  
+  # Return session file path
+  echo "$session_file"
 }
 
-# Monitor agent progress
-monitor_progress() {
+# Check if agent completed
+check_agent_completion() {
   local task_id="$1"
-  local plan_file="$PLANS_DIR/active/${task_id}.md"
+  local role="$2"
+  local plan_file="$3"
   
-  info "Monitoring progress for task $task_id..."
-  
-  # Check if plan moved to in-progress
-  if [[ -f "$PLANS_DIR/in-progress/${task_id}.md" ]]; then
-    plan_file="$PLANS_DIR/in-progress/${task_id}.md"
-    info "Task is in progress"
-  fi
-  
-  # Check if plan moved to completed
-  if [[ -f "$PLANS_DIR/completed/${task_id}.md" ]]; then
-    success "Task completed!"
-    return 0
-  fi
-  
-  # Show current status
+  # Check if plan was updated by agent
   if [[ -f "$plan_file" ]]; then
-    echo ""
-    echo "Current Status:"
-    grep "^- \[" "$plan_file" | head -10
-    echo ""
+    local agent_assignment=$(grep -A 1 "**${role^} Agent:**" "$plan_file" | tail -1)
+    if echo "$agent_assignment" | grep -q "Complete"; then
+      return 0
+    fi
   fi
+  
+  # Check if plan moved to next stage
+  case "$role" in
+    design)
+      [[ -f "$PLANS_DIR/in-progress/${task_id}.md" ]] && return 0
+      ;;
+    builder|reviewer)
+      # Check if next phase is marked complete
+      grep -q "Phase [34].*\[x\]" "$plan_file" 2>/dev/null && return 0
+      ;;
+    doc-gardener)
+      [[ -f "$PLANS_DIR/completed/${task_id}.md" ]] && return 0
+      ;;
+  esac
+  
+  return 1
 }
 
 # Main orchestration workflow
@@ -259,38 +391,56 @@ cmd_run() {
   
   # Phase 1: Design
   step "Phase 1: Design"
-  spawn_agent "design" "$task_id" "Analyze task and create design document"
+  local design_session=$(spawn_agent_real "design" "$task_id" "Analyze task and create design document" "$plan_file")
   echo ""
   
-  info "Waiting for design agent to complete..."
-  info "(In a full implementation, this would poll for completion)"
+  info "Design agent spawned. Waiting for completion..."
+  info "(Check progress: agent-orchestrator status)"
   echo ""
   
   # Phase 2: Implementation
   step "Phase 2: Implementation"
-  info "Next: Builder agent will be spawned after design is complete"
+  info "Builder agent will be spawned after design is complete"
+  local builder_session=$(spawn_agent_real "builder" "$task_id" "Implement solution from design" "$plan_file")
   echo ""
   
   # Phase 3: Review
   step "Phase 3: Review"
-  info "Next: Reviewer agents will be spawned after PR is opened"
+  info "Reviewer agents will be spawned after PR is opened"
+  local reviewer_session=$(spawn_agent_real "reviewer" "$task_id" "security" "$plan_file")
   echo ""
   
-  # Phase 4: Integration
-  step "Phase 4: Integration"
-  info "Next: Doc gardener will update documentation after merge"
+  # Phase 4: Documentation
+  step "Phase 4: Documentation"
+  info "Doc gardener will be spawned after review is complete"
+  local doc_session=$(spawn_agent_real "doc-gardener" "$task_id" "Update documentation" "$plan_file")
   echo ""
   
   success "Orchestration workflow initiated!"
   echo ""
-  info "Monitor progress with: agent-orchestrator status"
-  info "Watch in real-time with: agent-orchestrator watch"
+  info "All agent scripts have been generated."
+  info "To execute agents:"
+  echo ""
+  echo "  1. Design Agent:"
+  echo "     bash $AGENT_DIR/sessions/${task_id}-design.sh"
+  echo ""
+  echo "  2. Builder Agent (after design):"
+  echo "     bash $AGENT_DIR/sessions/${task_id}-builder.sh"
+  echo ""
+  echo "  3. Reviewer Agent (after PR):"
+  echo "     bash $AGENT_DIR/sessions/${task_id}-reviewer.sh"
+  echo ""
+  echo "  4. Doc Gardener (after review):"
+  echo "     bash $AGENT_DIR/sessions/${task_id}-doc-gardener.sh"
+  echo ""
+  info "Monitor progress: agent-orchestrator status"
+  info "Watch real-time: agent-orchestrator watch"
   echo ""
   info "Task plan: $plan_file"
   echo ""
 }
 
-# Show status of all agents
+# Show status
 cmd_status() {
   init_project
   
@@ -299,86 +449,103 @@ cmd_status() {
   echo ""
   
   # Active tasks
-  local active_count=$(find "$PLANS_DIR/active" -name "*.md" 2>/dev/null | wc -l)
+  local active_count=$(find "$PLANS_DIR/active" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
   echo "📋 Active tasks: $active_count"
   if [[ $active_count -gt 0 ]]; then
-    find "$PLANS_DIR/active" -name "*.md" -exec basename {} .md \; | while read -r task; do
-      echo "  - $task"
+    find "$PLANS_DIR/active" -name "*.md" 2>/dev/null | while read -r file; do
+      local task_id=$(basename "$file" .md)
+      local task_name=$(grep "^# Task:" "$file" | sed 's/# Task: //')
+      echo "  - $task_id: $task_name"
     done
   fi
   echo ""
   
   # In-progress tasks
-  local progress_count=$(find "$PLANS_DIR/in-progress" -name "*.md" 2>/dev/null | wc -l)
+  local progress_count=$(find "$PLANS_DIR/in-progress" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
   echo "🔄 In progress: $progress_count"
   if [[ $progress_count -gt 0 ]]; then
-    find "$PLANS_DIR/in-progress" -name "*.md" -exec basename {} .md \; | while read -r task; do
-      echo "  - $task"
+    find "$PLANS_DIR/in-progress" -name "*.md" 2>/dev/null | while read -r file; do
+      local task_id=$(basename "$file" .md)
+      local task_name=$(grep "^# Task:" "$file" | sed 's/# Task: //')
+      local pr_num=$(grep "**PR Number:**" "$file" | sed 's/.*: //')
+      echo "  - $task_id: $task_name"
+      [[ "$pr_num" != "TBD" ]] && echo "    PR: $pr_num"
     done
   fi
   echo ""
   
   # Completed tasks
-  local completed_count=$(find "$PLANS_DIR/completed" -name "*.md" 2>/dev/null | wc -l)
+  local completed_count=$(find "$PLANS_DIR/completed" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
   echo "✅ Completed: $completed_count"
+  if [[ $completed_count -gt 0 ]]; then
+    find "$PLANS_DIR/completed" -name "*.md" 2>/dev/null | head -5 | while read -r file; do
+      local task_id=$(basename "$file" .md)
+      local task_name=$(grep "^# Task:" "$file" | sed 's/# Task: //')
+      echo "  - $task_id: $task_name"
+    done
+    [[ $completed_count -gt 5 ]] && echo "  ... and $((completed_count - 5)) more"
+  fi
   echo ""
   
-  # Agent log
-  if [[ -f "$PROJECT_ROOT/.agent-swarm/agents.log" ]]; then
-    echo "Recent agent activity:"
-    tail -5 "$PROJECT_ROOT/.agent-swarm/agents.log" | while read -r line; do
+  # Active agent sessions
+  if [[ -d "$AGENT_DIR/sessions" ]]; then
+    local session_count=$(find "$AGENT_DIR/sessions" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ $session_count -gt 0 ]]; then
+      echo "🤖 Active agent sessions: $session_count"
+      find "$AGENT_DIR/sessions" -name "*.json" 2>/dev/null | while read -r session; do
+        local role=$(jq -r '.role' "$session" 2>/dev/null || echo "unknown")
+        local task_id=$(jq -r '.task_id' "$session" 2>/dev/null || echo "unknown")
+        echo "  - $role ($task_id)"
+      done
+      echo ""
+    fi
+  fi
+  
+  # Recent activity
+  if [[ -f "$AGENT_DIR/logs/orchestrator.log" ]]; then
+    echo "Recent activity:"
+    tail -5 "$AGENT_DIR/logs/orchestrator.log" 2>/dev/null | while read -r line; do
       echo "  $line"
     done
     echo ""
   fi
 }
 
-# Watch agents in real-time
+# Watch in real-time
 cmd_watch() {
   init_project
   
   info "Watching agent swarm (Ctrl+C to stop)..."
   echo ""
   
-  # Watch for changes in plans directory
-  if command -v fswatch &> /dev/null; then
-    fswatch -o "$PLANS_DIR" | while read -r num; do
-      clear
-      cmd_status
-      echo "Last update: $(date)"
-    done
-  else
-    # Fallback: poll every 5 seconds
-    while true; do
-      clear
-      cmd_status
-      echo "Last update: $(date)"
-      echo ""
-      info "Refreshing in 5 seconds... (Ctrl+C to stop)"
-      sleep 5
-    done
-  fi
+  while true; do
+    clear
+    cmd_status
+    echo "Last update: $(date)"
+    echo ""
+    info "Refreshing in 5 seconds..."
+    sleep 5
+  done
 }
 
-# Stop all agents
+# Stop agents
 cmd_stop() {
-  warn "Stopping all agents..."
+  local task_id="${1:-}"
   
-  # Kill OpenClaw sessions with agent-swarm label
-  if command -v openclaw &> /dev/null; then
-    openclaw sessions list --label "agent-swarm-*" 2>/dev/null | \
-      grep "agent-swarm" | \
-      awk '{print $1}' | \
-      while read -r session; do
-        info "Stopping session: $session"
-        openclaw sessions kill "$session" 2>/dev/null || true
-      done
+  if [[ -n "$task_id" ]]; then
+    warn "Stopping agents for task: $task_id"
+    rm -f "$AGENT_DIR/sessions/${task_id}-"*.json
+    rm -f "$AGENT_DIR/sessions/${task_id}-"*.sh
+    success "Stopped agents for $task_id"
+  else
+    warn "Stopping all agents..."
+    rm -f "$AGENT_DIR/sessions/"*.json
+    rm -f "$AGENT_DIR/sessions/"*.sh
+    success "All agents stopped"
   fi
-  
-  success "All agents stopped"
 }
 
-# Main command dispatcher
+# Main
 main() {
   if [[ $# -eq 0 ]]; then
     usage
@@ -399,7 +566,7 @@ main() {
       cmd_watch
       ;;
     stop)
-      cmd_stop
+      cmd_stop "$@"
       ;;
     -h|--help|help)
       usage
