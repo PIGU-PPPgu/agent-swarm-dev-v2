@@ -132,11 +132,70 @@ project/
 
 ## Platform Support
 
-- ✅ **OpenClaw** - Native support via `openclaw spawn`
+- ✅ **OpenClaw** - Full support with `openclaw chat`
+- ✅ **Codex** - Full support with `codex` CLI  
+- ✅ **Claude Code** - Full support with `claude` CLI
 - ✅ **Cursor** - Use multiple tabs with role-specific system prompts
-- ✅ **Codex CLI** - Use `--agent-role` flag
-- ✅ **Claude Code** - Spawn sub-agents with role prompts
-- ✅ **Any AI assistant** - Follow the communication protocol
+- ✅ **Manual** - Agent scripts can be executed manually if no CLI available
+
+The orchestrator automatically detects which AI CLI is available and generates appropriate agent scripts.
+
+## Quick Start
+
+### Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/PIGU-PPPgu/agent-swarm-dev-v2.git
+cd agent-swarm-dev-v2
+
+# Add to PATH (optional)
+export PATH="$PATH:$(pwd)/bin"
+
+# Or install globally
+sudo cp bin/* /usr/local/bin/
+```
+
+### Prerequisites
+
+Install at least one AI CLI:
+
+**OpenClaw:**
+```bash
+npm install -g openclaw
+openclaw gateway start
+```
+
+**Codex:**
+```bash
+# Follow instructions at https://codex.dev
+```
+
+**Claude Code:**
+```bash
+# Follow instructions at https://claude.ai/code
+```
+
+### Usage
+
+```bash
+# 1. Initialize your project
+cd your-project
+harness init
+
+# 2. Start autonomous development
+agent-orchestrator run "Implement user authentication"
+
+# 3. Execute agents (automatically uses available CLI)
+bash .agent-swarm/sessions/task-xxx-design.sh
+bash .agent-swarm/sessions/task-xxx-builder.sh
+bash .agent-swarm/sessions/task-xxx-reviewer.sh
+bash .agent-swarm/sessions/task-xxx-doc-gardener.sh
+
+# 4. Monitor progress
+agent-orchestrator status
+agent-orchestrator watch
+```
 
 ## Why This Works
 

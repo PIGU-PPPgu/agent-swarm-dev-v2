@@ -279,33 +279,75 @@ When done, your final message should be: DOC_COMPLETE"
   # Create session tracking file
   local session_file="$AGENT_DIR/sessions/${task_id}-${role}.json"
   
-  # Spawn using OpenClaw (this is a placeholder - actual implementation would use OpenClaw's API)
-  # For now, we'll create a script that can be run manually or by a daemon
+  # Spawn using available AI CLI
   local agent_script="$AGENT_DIR/sessions/${task_id}-${role}.sh"
+  
+  # Detect available AI CLI
+  local ai_cli=""
+  local ai_command=""
+  
+  if command -v openclaw &> /dev/null; then
+    ai_cli="openclaw"
+    ai_command="openclaw chat --cwd '$PROJECT_ROOT'"
+  elif command -v codex &> /dev/null; then
+    ai_cli="codex"
+    ai_command="codex --cwd '$PROJECT_ROOT'"
+  elif command -v claude &> /dev/null; then
+    ai_cli="claude"
+    ai_command="claude --cwd '$PROJECT_ROOT'"
+  else
+    ai_cli="manual"
+    ai_command="# No AI CLI detected - execute manually"
+  fi
   
   cat > "$agent_script" << EOSCRIPT
 #!/usr/bin/env bash
 # Agent: $role
 # Task: $task_id
 # Generated: $(date -Iseconds)
+# AI CLI: $ai_cli
 
 cd "$PROJECT_ROOT"
 
 echo "🤖 $role Agent starting..."
 echo "Task ID: $task_id"
 echo "Plan: $plan_file"
+echo "AI CLI: $ai_cli"
 echo ""
 
 # Agent prompt
-cat << 'EOPROMPT'
+AGENT_PROMPT=\$(cat << 'EOPROMPT'
 $agent_prompt
 EOPROMPT
+)
 
+echo "Agent Instructions:"
+echo "\$AGENT_PROMPT"
 echo ""
-echo "To execute this agent, run:"
-echo "  openclaw chat --cwd '$PROJECT_ROOT' --task '\$(cat $agent_script | grep -A 999 'EOPROMPT' | grep -B 999 'EOPROMPT' | grep -v EOPROMPT)'"
-echo ""
-echo "Or manually execute the steps above."
+
+# Execute based on available CLI
+case "$ai_cli" in
+  openclaw)
+    echo "Executing with OpenClaw..."
+    openclaw chat --cwd "$PROJECT_ROOT" --task "\$AGENT_PROMPT"
+    ;;
+  codex)
+    echo "Executing with Codex..."
+    codex --cwd "$PROJECT_ROOT" "\$AGENT_PROMPT"
+    ;;
+  claude)
+    echo "Executing with Claude Code..."
+    claude --cwd "$PROJECT_ROOT" "\$AGENT_PROMPT"
+    ;;
+  manual)
+    echo "No AI CLI detected. Please execute the instructions above manually."
+    echo ""
+    echo "Or install one of:"
+    echo "  - OpenClaw: https://openclaw.ai"
+    echo "  - Codex: https://codex.dev"
+    echo "  - Claude Code: https://claude.ai/code"
+    ;;
+esac
 EOSCRIPT
   
   chmod +x "$agent_script"
