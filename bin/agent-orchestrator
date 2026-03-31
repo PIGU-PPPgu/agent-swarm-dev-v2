@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# Agent Orchestrator - Main coordinator for agent swarm development
+# Receives high-level tasks and coordinates specialized agents
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+PLANS_DIR="$PROJECT_ROOT/plans"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Helper functions
+info() { echo -e "${BLUE}ℹ${NC} $*"; }
+success() { echo -e "${GREEN}✓${NC} $*"; }
+warn() { echo -e "${YELLOW}⚠${NC} $*"; }
+error() { echo -e "${RED}✗${NC} $*"; }
+agent() { echo -e "${MAGENTA}🤖${NC} $*"; }
+step() { echo -e "${CYAN}→${NC} $*"; }
+
+usage() {
+  cat << EOF
+Agent Orchestrator - Autonomous Development Workflow
+
+Usage: agent-orchestrator <command> [options]
+
+Commands:
+  run <task>           Execute a high-level task autonomously
+  status               Show current agent activities
+  watch                Watch and coordinate agents in real-time
+  stop                 Stop all running agents
+
+Examples:
+  agent-orchestrator run "Implement user authentication"
+  agent-orchestrator run "Fix bug #123"
+  agent-orchestrator watch
+  agent-orchestrator status
+
+The orchestrator will:
+  1. Analyze the task
+  2. Create execution plan
+  3. Spawn specialized agents (design, builder, reviewer, etc.)
+  4. Coordinate agent-to-agent communication
+  5. Monitor progress and handle feedback loops
+  6. Merge results when complete
+
+EOF
+}
+
+# Initialize project structure if needed
+init_project() {
+  if [[ ! -d "$PLANS_DIR" ]]; then
+    info "Initializing project structure..."
+    mkdir -p "$PLANS_DIR"/{active,in-progress,completed,failed}
+    mkdir -p "$PROJECT_ROOT/docs"/{design-docs,architecture}
+    mkdir -p "$PROJECT_ROOT/.agent-swarm"
+    success "Project structure initialized"
+  fi
+}
+
+# Generate unique task ID
+generate_task_id() {
+  echo "task-$(date +%Y%m%d-%H%M%S)-$(openssl rand -hex 3)"
+}
+
+# Create execution plan from task description
+create_execution_plan() {
+  local task="$1"
+  local task_id="$2"
+  local plan_file="$PLANS_DIR/active/${task_id}.md"
+  
+  step "Creating execution plan..."
+  
+  cat > "$plan_file" << EOF
+# Task: $task
+
+**ID:** $task_id
+**Status:** active
+**Created:** $(date -Iseconds)
+**Owner:** orchestrator
+
+## Goal
+$task
+
+## Execution Steps
+
+### Phase 1: Design
+- [ ] Analyze requirements
+- [ ] Create design document
+- [ ] Define architecture impact
+
+### Phase 2: Implementation
+- [ ] Implement core functionality
+- [ ] Write unit tests
+- [ ] Run quality checks
+
+### Phase 3: Review
+- [ ] Self-review
+- [ ] Request agent reviews
+- [ ] Address feedback
+
+### Phase 4: Integration
+- [ ] Merge PR
+- [ ] Update documentation
+- [ ] Mark as complete
+
+## Agent Assignments
+- **Design Agent:** TBD
+- **Builder Agent:** TBD
+- **Reviewer Agent:** TBD
+- **Doc Agent:** TBD
+
+## Progress Log
+- $(date -Iseconds): Task created by orchestrator
+
+## Decisions
+(To be filled by agents)
+
+## Blockers
+None
+
+---
+*This plan is managed by the agent orchestrator*
+EOF
+  
+  success "Execution plan created: $plan_file"
+  echo "$plan_file"
+}
+
+# Spawn a specialized agent
+spawn_agent() {
+  local role="$1"
+  local task_id="$2"
+  local context="$3"
+  
+  agent "Spawning $role agent for task $task_id..."
+  
+  # Create agent-specific prompt
+  local agent_prompt=""
+  case "$role" in
+    design)
+      agent_prompt="You are a Design Agent. Read the task in plans/active/${task_id}.md and create a design document in docs/design-docs/. Focus on architecture, data models, and API contracts. Use /harness audit to check current state first."
+      ;;
+    builder)
+      agent_prompt="You are a Builder Agent. Read the design document and task plan in plans/active/${task_id}.md. Implement the solution following architecture constraints. Run /harness enforce --check before opening PR. Write tests."
+      ;;
+    reviewer)
+      agent_prompt="You are a Reviewer Agent. Review the PR mentioned in plans/active/${task_id}.md. Check architecture compliance with /harness enforce --check. Verify test coverage. Leave detailed feedback."
+      ;;
+    doc-gardener)
+      agent_prompt="You are a Doc Gardener Agent. Update documentation related to the changes in plans/active/${task_id}.md. Run /harness garden --docs-only to check for issues."
+      ;;
+    *)
+      error "Unknown agent role: $role"
+      return 1
+      ;;
+  esac
+  
+  # Log agent spawn
+  local log_file="$PROJECT_ROOT/.agent-swarm/agents.log"
+  mkdir -p "$(dirname "$log_file")"
+  echo "$(date -Iseconds) | SPAWN | $role | $task_id | $context" >> "$log_file"
+  
+  # Spawn agent using OpenClaw (if available)
+  if command -v openclaw &> /dev/null; then
+    info "Using OpenClaw to spawn $role agent..."
+    
+    # Use sessions_spawn via OpenClaw CLI
+    # Note: This requires OpenClaw to be running
+    local task_prompt="$agent_prompt
+
+Context: $context
+
+Task Plan: plans/active/${task_id}.md
+
+When you complete your work:
+1. Update the task plan with your progress
+2. Add your decisions to the Decisions section
+3. Update the Progress Log
+4. If you open a PR, add the PR number to the plan
+5. Move the plan to plans/in-progress/ when you start
+6. Reply with 'AGENT_COMPLETE' when done
+"
+    
+    # For now, just log what would be spawned
+    # TODO: Integrate with OpenClaw sessions_spawn API
+    info "Would spawn agent with task:"
+    echo "$task_prompt" | head -3
+    echo "..."
+    
+    success "$role agent spawned (simulated)"
+  else
+    warn "OpenClaw not available, simulating agent spawn"
+    info "Agent would execute: $agent_prompt"
+  fi
+}
+
+# Monitor agent progress
+monitor_progress() {
+  local task_id="$1"
+  local plan_file="$PLANS_DIR/active/${task_id}.md"
+  
+  info "Monitoring progress for task $task_id..."
+  
+  # Check if plan moved to in-progress
+  if [[ -f "$PLANS_DIR/in-progress/${task_id}.md" ]]; then
+    plan_file="$PLANS_DIR/in-progress/${task_id}.md"
+    info "Task is in progress"
+  fi
+  
+  # Check if plan moved to completed
+  if [[ -f "$PLANS_DIR/completed/${task_id}.md" ]]; then
+    success "Task completed!"
+    return 0
+  fi
+  
+  # Show current status
+  if [[ -f "$plan_file" ]]; then
+    echo ""
+    echo "Current Status:"
+    grep "^- \[" "$plan_file" | head -10
+    echo ""
+  fi
+}
+
+# Main orchestration workflow
+cmd_run() {
+  local task="$*"
+  
+  if [[ -z "$task" ]]; then
+    error "Task description required"
+    usage
+    return 1
+  fi
+  
+  init_project
+  
+  echo ""
+  info "🚀 Starting autonomous development workflow"
+  echo ""
+  info "Task: $task"
+  echo ""
+  
+  # Generate task ID
+  local task_id=$(generate_task_id)
+  info "Task ID: $task_id"
+  echo ""
+  
+  # Create execution plan
+  local plan_file=$(create_execution_plan "$task" "$task_id")
+  echo ""
+  
+  # Phase 1: Design
+  step "Phase 1: Design"
+  spawn_agent "design" "$task_id" "Analyze task and create design document"
+  echo ""
+  
+  info "Waiting for design agent to complete..."
+  info "(In a full implementation, this would poll for completion)"
+  echo ""
+  
+  # Phase 2: Implementation
+  step "Phase 2: Implementation"
+  info "Next: Builder agent will be spawned after design is complete"
+  echo ""
+  
+  # Phase 3: Review
+  step "Phase 3: Review"
+  info "Next: Reviewer agents will be spawned after PR is opened"
+  echo ""
+  
+  # Phase 4: Integration
+  step "Phase 4: Integration"
+  info "Next: Doc gardener will update documentation after merge"
+  echo ""
+  
+  success "Orchestration workflow initiated!"
+  echo ""
+  info "Monitor progress with: agent-orchestrator status"
+  info "Watch in real-time with: agent-orchestrator watch"
+  echo ""
+  info "Task plan: $plan_file"
+  echo ""
+}
+
+# Show status of all agents
+cmd_status() {
+  init_project
+  
+  echo ""
+  info "Agent Swarm Status"
+  echo ""
+  
+  # Active tasks
+  local active_count=$(find "$PLANS_DIR/active" -name "*.md" 2>/dev/null | wc -l)
+  echo "📋 Active tasks: $active_count"
+  if [[ $active_count -gt 0 ]]; then
+    find "$PLANS_DIR/active" -name "*.md" -exec basename {} .md \; | while read -r task; do
+      echo "  - $task"
+    done
+  fi
+  echo ""
+  
+  # In-progress tasks
+  local progress_count=$(find "$PLANS_DIR/in-progress" -name "*.md" 2>/dev/null | wc -l)
+  echo "🔄 In progress: $progress_count"
+  if [[ $progress_count -gt 0 ]]; then
+    find "$PLANS_DIR/in-progress" -name "*.md" -exec basename {} .md \; | while read -r task; do
+      echo "  - $task"
+    done
+  fi
+  echo ""
+  
+  # Completed tasks
+  local completed_count=$(find "$PLANS_DIR/completed" -name "*.md" 2>/dev/null | wc -l)
+  echo "✅ Completed: $completed_count"
+  echo ""
+  
+  # Agent log
+  if [[ -f "$PROJECT_ROOT/.agent-swarm/agents.log" ]]; then
+    echo "Recent agent activity:"
+    tail -5 "$PROJECT_ROOT/.agent-swarm/agents.log" | while read -r line; do
+      echo "  $line"
+    done
+    echo ""
+  fi
+}
+
+# Watch agents in real-time
+cmd_watch() {
+  init_project
+  
+  info "Watching agent swarm (Ctrl+C to stop)..."
+  echo ""
+  
+  # Watch for changes in plans directory
+  if command -v fswatch &> /dev/null; then
+    fswatch -o "$PLANS_DIR" | while read -r num; do
+      clear
+      cmd_status
+      echo "Last update: $(date)"
+    done
+  else
+    # Fallback: poll every 5 seconds
+    while true; do
+      clear
+      cmd_status
+      echo "Last update: $(date)"
+      echo ""
+      info "Refreshing in 5 seconds... (Ctrl+C to stop)"
+      sleep 5
+    done
+  fi
+}
+
+# Stop all agents
+cmd_stop() {
+  warn "Stopping all agents..."
+  
+  # Kill OpenClaw sessions with agent-swarm label
+  if command -v openclaw &> /dev/null; then
+    openclaw sessions list --label "agent-swarm-*" 2>/dev/null | \
+      grep "agent-swarm" | \
+      awk '{print $1}' | \
+      while read -r session; do
+        info "Stopping session: $session"
+        openclaw sessions kill "$session" 2>/dev/null || true
+      done
+  fi
+  
+  success "All agents stopped"
+}
+
+# Main command dispatcher
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+  
+  local command="$1"
+  shift
+  
+  case "$command" in
+    run)
+      cmd_run "$@"
+      ;;
+    status)
+      cmd_status
+      ;;
+    watch)
+      cmd_watch
+      ;;
+    stop)
+      cmd_stop
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      error "Unknown command: $command"
+      echo ""
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
