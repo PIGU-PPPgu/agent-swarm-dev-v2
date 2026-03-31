@@ -1,0 +1,27 @@
+{
+  "name": "agent-swarm-dev",
+  "version": "1.0.0",
+  "description": "Multi-agent collaborative software development framework",
+  "keywords": [
+    "ai",
+    "agents",
+    "codex",
+    "claude",
+    "cursor",
+    "openclaw",
+    "collaboration",
+    "software-development"
+  ],
+  "author": "OpenClaw Community",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openclaw/agent-swarm-dev"
+  },
+  "scripts": {
+    "init": "node scripts/init.js"
+  },
+  "bin": {
+    "agent-swarm": "./scripts/init.js"
+  }
+}
