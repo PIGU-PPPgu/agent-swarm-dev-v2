@@ -1,7 +1,7 @@
 {
   "name": "agent-swarm-dev",
-  "version": "1.0.0",
-  "description": "Multi-agent collaborative software development framework",
+  "version": "2.0.0",
+  "description": "Multi-agent collaborative software development framework with integrated quality tools",
   "keywords": [
     "ai",
     "agents",

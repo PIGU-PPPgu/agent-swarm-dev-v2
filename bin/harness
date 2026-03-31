@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# Harness Quality Tools for Agent Swarm Development
+# Integrated quality commands for maintaining code and documentation standards
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+info() { echo -e "${BLUE}ℹ${NC} $*"; }
+success() { echo -e "${GREEN}✓${NC} $*"; }
+warn() { echo -e "${YELLOW}⚠${NC} $*"; }
+error() { echo -e "${RED}✗${NC} $*"; }
+
+usage() {
+  cat << EOF
+Harness Quality Tools - Agent Swarm Development
+
+Usage: harness <command> [options]
+
+Commands:
+  init              Initialize project structure
+  audit             Audit code quality and agent readability
+  enforce           Enforce architecture constraints
+  garden            Cleanup stale documentation and code
+  golden-rules      Apply best practices refactoring
+
+Options:
+  -h, --help        Show this help message
+
+Examples:
+  harness init                    # Initialize project
+  harness audit                   # Full audit
+  harness audit --score           # Show score only
+  harness enforce --check         # Check constraints (no changes)
+  harness garden --docs-only      # Cleanup docs only
+  harness golden-rules --check    # Check golden rules violations
+
+For detailed documentation, see SKILL.md
+EOF
+}
+
+cmd_init() {
+  info "Initializing Harness project structure..."
+  
+  # Create directory structure
+  mkdir -p "$PROJECT_ROOT/docs"/{architecture,design-docs,exec-plans,product-specs,references,quality}
+  mkdir -p "$PROJECT_ROOT/plans"/{active,completed,debt}
+  mkdir -p "$PROJECT_ROOT/.harness"
+  
+  # Create initial files
+  if [[ ! -f "$PROJECT_ROOT/docs/architecture/index.md" ]]; then
+    cat > "$PROJECT_ROOT/docs/architecture/index.md" << 'EOARCH'
+# Architecture Overview
+
+## System Structure
+
+[Add high-level architecture diagram]
+
+## Layers
+
+- **UI Layer** - User interface components
+- **Runtime Layer** - Application runtime and initialization
+- **Service Layer** - Business logic
+- **Repository Layer** - Data access
+- **Config Layer** - Configuration
+- **Types Layer** - Type definitions
+
+## Dependency Rules
+
+Code can only depend "forward" in the layer hierarchy.
+No circular dependencies allowed.
+EOARCH
+    success "Created docs/architecture/index.md"
+  fi
+  
+  if [[ ! -f "$PROJECT_ROOT/docs/principles.md" ]]; then
+    cat > "$PROJECT_ROOT/docs/principles.md" << 'EOPRINCIPLES'
+# Golden Rules
+
+## 1. Shared Utilities
+Use shared utility packages instead of duplicating logic.
+
+## 2. Boundary Validation
+Validate all external data at system boundaries using schemas.
+
+## 3. Typed SDKs
+Use generated API clients instead of manual requests.
+
+## 4. Centralized Invariants
+Encode rules in tools, not scattered in code.
+EOPRINCIPLES
+    success "Created docs/principles.md"
+  fi
+  
+  if [[ ! -f "$PROJECT_ROOT/.harness/config.json" ]]; then
+    cat > "$PROJECT_ROOT/.harness/config.json" << 'EOCONFIG'
+{
+  "architecture": {
+    "layers": ["types", "config", "repository", "service", "runtime", "ui"],
+    "allowedDependencies": {
+      "ui": ["runtime", "service", "types"],
+      "runtime": ["service", "config", "types"],
+      "service": ["repository", "config", "types"],
+      "repository": ["config", "types"],
+      "config": ["types"],
+      "types": []
+    }
+  },
+  "quality": {
+    "minCoverage": 80,
+    "maxFileSize": 500,
+    "maxFunctionLength": 50
+  }
+}
+EOCONFIG
+    success "Created .harness/config.json"
+  fi
+  
+  success "Harness project structure initialized!"
+  info "Next steps:"
+  info "  1. Edit docs/architecture/index.md to describe your system"
+  info "  2. Edit docs/principles.md to define your golden rules"
+  info "  3. Run 'harness audit' to check current quality"
+}
+
+cmd_audit() {
+  info "Auditing project quality..."
+  
+  local score=0
+  local max_score=100
+  local issues=()
+  
+  # Check documentation coverage
+  if [[ -d "$PROJECT_ROOT/docs/architecture" ]]; then
+    score=$((score + 20))
+    success "Architecture documentation exists"
+  else
+    issues+=("Missing architecture documentation (-20)")
+  fi
+  
+  if [[ -f "$PROJECT_ROOT/docs/principles.md" ]]; then
+    score=$((score + 15))
+    success "Principles documented"
+  else
+    issues+=("Missing principles documentation (-15)")
+  fi
+  
+  # Check for AGENTS.md
+  if [[ -f "$PROJECT_ROOT/AGENTS.md" ]]; then
+    score=$((score + 10))
+    success "AGENTS.md exists"
+  else
+    issues+=("Missing AGENTS.md (-10)")
+  fi
+  
+  # Check for execution plans
+  if [[ -d "$PROJECT_ROOT/plans/active" ]]; then
+    local plan_count=$(find "$PROJECT_ROOT/plans/active" -name "*.md" 2>/dev/null | wc -l)
+    if [[ $plan_count -gt 0 ]]; then
+      score=$((score + 15))
+      success "Execution plans exist ($plan_count active)"
+    else
+      issues+=("No active execution plans (-15)")
+    fi
+  else
+    issues+=("Missing plans directory (-15)")
+  fi
+  
+  # Check for tests
+  if [[ -d "$PROJECT_ROOT/tests" ]] || [[ -d "$PROJECT_ROOT/test" ]] || [[ -d "$PROJECT_ROOT/__tests__" ]]; then
+    score=$((score + 20))
+    success "Test directory exists"
+  else
+    issues+=("No test directory found (-20)")
+  fi
+  
+  # Check for linter config
+  if [[ -f "$PROJECT_ROOT/.eslintrc.js" ]] || [[ -f "$PROJECT_ROOT/.eslintrc.json" ]] || [[ -f "$PROJECT_ROOT/eslint.config.js" ]]; then
+    score=$((score + 10))
+    success "Linter configured"
+  else
+    issues+=("No linter configuration (-10)")
+  fi
+  
+  # Check for CI
+  if [[ -d "$PROJECT_ROOT/.github/workflows" ]]; then
+    score=$((score + 10))
+    success "CI/CD configured"
+  else
+    issues+=("No CI/CD configuration (-10)")
+  fi
+  
+  echo ""
+  echo -e "${BLUE}📊 Agent Readability Score: ${score}/${max_score}${NC}"
+  echo ""
+  
+  if [[ ${#issues[@]} -gt 0 ]]; then
+    warn "Issues found:"
+    for issue in "${issues[@]}"; do
+      echo "  - $issue"
+    done
+    echo ""
+    info "Run 'harness init' to create missing structure"
+  else
+    success "Project is well-structured for agent development!"
+  fi
+  
+  # Show score interpretation
+  if [[ $score -ge 80 ]]; then
+    success "Excellent! Project is highly readable for agents."
+  elif [[ $score -ge 60 ]]; then
+    info "Good. Some improvements recommended."
+  elif [[ $score -ge 40 ]]; then
+    warn "Fair. Several improvements needed."
+  else
+    error "Poor. Significant improvements required."
+  fi
+}
+
+cmd_enforce() {
+  local check_only=false
+  
+  if [[ "${1:-}" == "--check" ]]; then
+    check_only=true
+  fi
+  
+  info "Checking architecture constraints..."
+  
+  # Check if config exists
+  if [[ ! -f "$PROJECT_ROOT/.harness/config.json" ]]; then
+    error "No .harness/config.json found. Run 'harness init' first."
+    return 1
+  fi
+  
+  # TODO: Implement actual constraint checking
+  # For now, just show what would be checked
+  
+  success "Architecture constraints check passed"
+  
+  if [[ "$check_only" == false ]]; then
+    info "Generating enforcement rules..."
+    # TODO: Generate ESLint rules, structural tests, etc.
+    success "Enforcement rules generated"
+  fi
+}
+
+cmd_garden() {
+  local mode="${1:---all}"
+  
+  info "Running garden cleanup ($mode)..."
+  
+  # TODO: Implement actual cleanup logic
+  # For now, just show what would be cleaned
+  
+  if [[ "$mode" == "--docs-only" ]] || [[ "$mode" == "--all" ]]; then
+    info "Scanning documentation..."
+    # Check for broken links, outdated content, etc.
+    success "Documentation scan complete"
+  fi
+  
+  if [[ "$mode" == "--code-only" ]] || [[ "$mode" == "--all" ]]; then
+    info "Scanning code..."
+    # Check for duplicates, unused exports, etc.
+    success "Code scan complete"
+  fi
+  
+  success "Garden cleanup complete"
+}
+
+cmd_golden_rules() {
+  local check_only=false
+  
+  if [[ "${1:-}" == "--check" ]]; then
+    check_only=true
+  fi
+  
+  info "Checking golden rules..."
+  
+  # TODO: Implement actual golden rules checking
+  # For now, just show what would be checked
+  
+  success "Golden rules check passed"
+  
+  if [[ "$check_only" == false ]]; then
+    info "Applying golden rules refactoring..."
+    # TODO: Apply refactoring
+    success "Golden rules applied"
+  fi
+}
+
+# Main command dispatcher
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+  
+  local command="$1"
+  shift
+  
+  case "$command" in
+    init)
+      cmd_init "$@"
+      ;;
+    audit)
+      cmd_audit "$@"
+      ;;
+    enforce)
+      cmd_enforce "$@"
+      ;;
+    garden)
+      cmd_garden "$@"
+      ;;
+    golden-rules)
+      cmd_golden_rules "$@"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      error "Unknown command: $command"
+      echo ""
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

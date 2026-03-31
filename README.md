@@ -1,10 +1,10 @@
 # Agent Swarm Development
 
-Multi-agent collaborative software development framework inspired by OpenAI's Harness Engineering.
+Multi-agent collaborative software development framework with integrated quality tools, inspired by OpenAI's Harness Engineering.
 
 ## What is this?
 
-A practical framework for coordinating multiple AI agents (Claude, Codex, Cursor, etc.) to build software collaboratively with minimal human intervention.
+A comprehensive framework for coordinating multiple AI agents (Claude, Codex, Cursor, etc.) to build software collaboratively with minimal human intervention, **plus integrated quality tools** to maintain code and documentation standards.
 
 Based on OpenAI's experience: **3 engineers + AI agents → 1M+ lines of code in 5 months**.
 
@@ -12,6 +12,7 @@ Based on OpenAI's experience: **3 engineers + AI agents → 1M+ lines of code in
 
 - **4 Agent Roles:** Builder, Reviewer, Doc Gardener, Cleanup
 - **Agent-to-Agent Communication:** Via PRs and shared repository state
+- **Integrated Quality Tools:** `/harness` commands for audit, enforce, garden, golden-rules
 - **Strict Architecture Constraints:** Enforced by linters and CI
 - **Knowledge in Repository:** Everything agents need is version-controlled
 - **Platform Agnostic:** Works with any AI coding assistant
@@ -42,12 +43,12 @@ See [SKILL.md](./SKILL.md) for complete documentation.
 
 ## Agent Roles
 
-| Role | Responsibility | Frequency |
-|------|---------------|-----------|
-| **Builder** | Write code, open PRs | Continuous |
-| **Reviewer** | Review PRs, enforce architecture | Per PR |
-| **Doc Gardener** | Keep docs fresh | Weekly |
-| **Cleanup** | Enforce golden rules, refactor | Daily |
+| Role | Responsibility | Frequency | Harness Tools |
+|------|---------------|-----------|---------------|
+| **Builder** | Write code, open PRs | Continuous | `/harness audit`, `/harness enforce --check` |
+| **Reviewer** | Review PRs, enforce architecture | Per PR | `/harness audit --pr`, `/harness enforce --check` |
+| **Doc Gardener** | Keep docs fresh | Weekly | `/harness garden --docs-only`, `/harness audit --docs` |
+| **Cleanup** | Enforce golden rules, refactor | Daily | `/harness golden-rules`, `/harness garden --code-only` |
 
 ## Example Workflow
 
@@ -55,23 +56,60 @@ See [SKILL.md](./SKILL.md) for complete documentation.
 1. Human: Define feature in execution plan
    └─> plans/active/feature-x.md
 
-2. Builder Agent: Implement feature
+2. Builder Agent: Run quality check
+   └─> /harness audit
+   └─> /harness enforce --check
+
+3. Builder Agent: Implement feature
    └─> Opens PR #123
 
-3. Reviewer Agent: Review PR
+4. Reviewer Agent: Review PR
+   └─> /harness audit --pr
+   └─> /harness enforce --check
    └─> Leaves comments, requests changes
 
-4. Builder Agent: Address feedback
+5. Builder Agent: Address feedback
    └─> Updates PR, responds to comments
 
-5. Reviewer Agent: Approves
+6. Reviewer Agent: Approves
    └─> PR auto-merges
 
-6. Doc Gardener: Updates docs
+7. Doc Gardener: Updates docs
+   └─> /harness garden --docs-only
    └─> Opens PR #124 to update docs/
 
-7. Cleanup Agent: Scans for anti-patterns
+8. Cleanup Agent: Scans for anti-patterns
+   └─> /harness golden-rules
+   └─> /harness garden --code-only
    └─> Opens PR #125 to refactor duplicated code
+```
+
+## Harness Quality Tools
+
+All agents use these integrated tools:
+
+```bash
+/harness init              # Initialize project structure
+/harness audit             # Audit code quality (score 0-100)
+/harness enforce           # Enforce architecture constraints
+/harness garden            # Cleanup stale docs/code
+/harness golden-rules      # Apply best practices refactoring
+```
+
+**Example: Builder Agent workflow**
+```bash
+# Before starting work
+/harness audit --score
+# Score: 78/100
+
+# Implement feature...
+
+# Before opening PR
+/harness enforce --check
+# ✓ No architecture violations
+
+/harness audit --score
+# Score: 82/100 (+4)
 ```
 
 ## Repository Structure

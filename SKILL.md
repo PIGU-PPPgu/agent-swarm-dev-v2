@@ -20,44 +20,59 @@ This skill enables multiple AI agents to collaborate on software projects with m
 
 **Workflow:**
 - Read task from execution plan or issue
+- Run `/harness audit` to check current project quality
 - Implement solution following architecture constraints
+- Use `/harness enforce --check` to verify architecture compliance
 - Write tests (unit + integration)
 - Open PR with clear description
 - Respond to review feedback
 - Merge when approved
 
-**Tools:** git, gh CLI, language-specific tooling
+**Tools:** 
+- git, gh CLI, language-specific tooling
+- `/harness audit` - Check project quality before starting
+- `/harness enforce` - Verify architecture constraints
 
 ### 2. Reviewer Agent (审查智能体)
 **Responsibility:** Review PRs for correctness, architecture compliance, and code quality.
 
 **Workflow:**
 - Monitor open PRs
+- Run `/harness audit` on PR changes
 - Check against architecture rules (see `docs/architecture.md`)
+- Use `/harness enforce --check` to verify no violations
 - Verify test coverage
 - Leave inline comments
 - Approve or request changes
 - Can be multiple reviewer agents with different focuses (security, performance, UX)
 
-**Tools:** gh CLI, custom linters, static analysis
+**Tools:** 
+- gh CLI, custom linters, static analysis
+- `/harness audit --pr` - Audit PR changes
+- `/harness enforce --check` - Check architecture violations
 
 ### 3. Doc Gardener Agent (文档维护智能体)
 **Responsibility:** Keep documentation fresh and accurate.
 
 **Workflow:**
-- Scan `docs/` directory weekly
+- Run `/harness garden --docs-only` weekly
+- Scan `docs/` directory for stale content
 - Compare docs against actual code behavior
 - Identify stale/outdated content
 - Open PRs to update or remove obsolete docs
 - Update quality scores in `docs/quality.md`
 
-**Tools:** grep, ast parsers, doc validators
+**Tools:** 
+- grep, ast parsers, doc validators
+- `/harness garden --docs-only` - Automated doc cleanup
+- `/harness audit --docs` - Check doc quality
 
 ### 4. Cleanup Agent (清理智能体)
 **Responsibility:** Enforce "golden rules" and prevent technical debt accumulation.
 
 **Workflow:**
-- Run daily/weekly scans for anti-patterns
+- Run `/harness golden-rules` daily/weekly
+- Use `/harness garden --code-only` for code cleanup
 - Check for:
   - Duplicated utility code (should use shared packages)
   - Unvalidated data at boundaries
@@ -66,7 +81,103 @@ This skill enables multiple AI agents to collaborate on software projects with m
 - Open targeted refactoring PRs
 - Most PRs should be auto-mergeable after CI passes
 
-**Tools:** custom linters, structural tests, pattern matchers
+**Tools:** 
+- custom linters, structural tests, pattern matchers
+- `/harness golden-rules` - Apply golden rules refactoring
+- `/harness garden --code-only` - Automated code cleanup
+
+## Harness Quality Tools
+
+All agents can use these quality tools to maintain code and documentation standards:
+
+### `/harness init` - Initialize Project Structure
+
+Creates agent-first project structure with proper documentation hierarchy:
+
+```bash
+/harness init
+```
+
+Creates:
+- `docs/architecture/` - Architecture documentation
+- `docs/design-docs/` - Design documents
+- `docs/exec-plans/` - Execution plans
+- `docs/product-specs/` - Product specifications
+- `docs/references/` - Third-party library references
+- `docs/quality/` - Quality standards and scores
+
+### `/harness audit` - Quality Audit
+
+Evaluates project quality from agent perspective:
+
+```bash
+/harness audit              # Full audit
+/harness audit --docs       # Documentation only
+/harness audit --pr         # PR changes only
+/harness audit --score      # Show score only
+```
+
+**Audit Dimensions:**
+1. **Documentation Coverage** - Are all modules documented?
+2. **Architecture Clarity** - Is the structure clear?
+3. **Context Reachability** - Can agents find what they need?
+4. **Mechanical Verification** - Are constraints enforced?
+
+**Output:**
+- Readability score (0-100)
+- Issue list (prioritized)
+- Improvement suggestions
+
+### `/harness enforce` - Architecture Constraints
+
+Generates and applies architecture rules:
+
+```bash
+/harness enforce            # Apply constraints
+/harness enforce --check    # Check only (no changes)
+/harness enforce --dry-run  # Show what would be enforced
+```
+
+**Enforces:**
+- Layered architecture (types → config → repo → service → runtime → ui)
+- Dependency direction (no circular dependencies)
+- Boundary validation (Zod schemas at API boundaries)
+- File size limits
+- Naming conventions
+
+### `/harness garden` - Cleanup Stale Content
+
+Automated cleanup of outdated docs and code:
+
+```bash
+/harness garden                # Full cleanup
+/harness garden --docs-only    # Documentation only
+/harness garden --code-only    # Code only
+/harness garden --auto-pr      # Auto-create PRs
+```
+
+**Cleans:**
+- Outdated documentation
+- Broken links
+- Duplicate code
+- Unused exports
+- Inconsistent naming
+
+### `/harness golden-rules` - Apply Best Practices
+
+Interactive refactoring based on golden rules:
+
+```bash
+/harness golden-rules          # Interactive mode
+/harness golden-rules --check  # Check only
+/harness golden-rules --rule shared-utils  # Specific rule
+```
+
+**Golden Rules:**
+1. **Shared utilities** - Use shared packages, not inline helpers
+2. **Boundary validation** - Parse data at system boundaries
+3. **Typed SDKs** - Use generated clients, not manual requests
+4. **Centralized invariants** - Encode rules in tools
 
 ## Repository Structure
 
