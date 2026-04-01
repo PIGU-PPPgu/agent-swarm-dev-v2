@@ -92,6 +92,12 @@ plan-update log        # Append to task progress log
 plan-update decision   # Record a decision in the task log
 plan-update phase      # Mark a phase complete
 plan-update pr         # Set PR number on task plan
+agent-observe logs     # Query application logs
+agent-observe metrics  # Query collected metrics
+agent-observe screenshot --url <url>   # Capture UI screenshot
+agent-observe health   # Check app health endpoints
+agent-observe trace    # Show full task execution trace
+agent-observe record   # Emit a metric event
 gh pr create           # Open a PR
 gh pr review           # Review a PR
 ```

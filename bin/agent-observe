@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# agent-observe - Observability tool for agents
+# Lets agents query logs, metrics, and capture UI screenshots
+# Lightweight local stack: no Grafana/Prometheus required
+
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+AGENT_DIR="$PROJECT_ROOT/.agent-swarm"
+OBS_DIR="$AGENT_DIR/observability"
+
+info()    { echo -e "\033[0;34mℹ\033[0m $*"; }
+success() { echo -e "\033[0;32m✓\033[0m $*"; }
+warn()    { echo -e "\033[1;33m⚠\033[0m $*"; }
+error()   { echo -e "\033[0;31m✗\033[0m $*"; }
+
+usage() {
+  cat << EOF
+agent-observe - Observability for agents
+
+Usage: agent-observe <command> [args]
+
+Commands:
+  logs [--filter <pattern>] [--tail <n>] [--since <time>]
+                          Query application logs
+  metrics [--name <metric>] [--since <time>]
+                          Query collected metrics
+  screenshot [--url <url>] [--out <file>]
+                          Capture UI screenshot
+  trace <task-id>         Show full execution trace for a task
+  health                  Check application health endpoints
+  record <event> [data]   Record a metric event (for agents to emit)
+
+Examples:
+  agent-observe logs --filter "ERROR" --tail 50
+  agent-observe logs --since "10 minutes ago"
+  agent-observe metrics --name "response_time"
+  agent-observe screenshot --url http://localhost:3000 --out /tmp/ui.png
+  agent-observe health
+  agent-observe record "build_duration" "120s"
+  agent-observe trace task-20260402-001234-abc123
+
+EOF
+}
+
+init_obs() {
+  mkdir -p "$OBS_DIR"/{logs,metrics,screenshots,traces}
+}
+
+# ─── LOGS ────────────────────────────────────────────────────────────────────
+
+cmd_logs() {
+  local filter="" tail_n=100 since=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --filter) filter="$2"; shift 2 ;;
+      --tail)   tail_n="$2"; shift 2 ;;
+      --since)  since="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # Collect log sources
+  local sources=()
+
+  # 1. Agent swarm logs
+  [[ -d "$AGENT_DIR/logs" ]] && sources+=("$AGENT_DIR/logs"/*.log)
+
+  # 2. App logs (common locations)
+  for loc in \
+    "$PROJECT_ROOT/logs" \
+    "$PROJECT_ROOT/log" \
+    "/tmp/app-logs" \
+    "$PROJECT_ROOT/.next/server" \
+    "$PROJECT_ROOT/dist/logs"; do
+    if [[ -d "$loc" ]]; then
+      while IFS= read -r f; do sources+=("$f"); done < <(find "$loc" -maxdepth 1 -name "*.log" 2>/dev/null)
+    fi
+  done
+
+  # 3. npm/node process logs
+  [[ -f "$PROJECT_ROOT/.agent-swarm/app.log" ]] && sources+=("$PROJECT_ROOT/.agent-swarm/app.log")
+
+  if [[ ${#sources[@]} -eq 0 ]]; then
+    warn "No log files found. Is the application running?"
+    info "Tip: Start app with: npm run dev 2>&1 | tee .agent-swarm/app.log"
+    return 0
+  fi
+
+  info "Querying logs (filter='${filter:-*}', tail=$tail_n, since='${since:-all}')"
+  echo ""
+
+  # Build grep/awk pipeline
+  local cmd="cat"
+
+  # Filter by time if --since provided
+  if [[ -n "$since" ]]; then
+    local since_ts
+    since_ts=$(date -d "$since" +%s 2>/dev/null || date -v "-${since// /}" +%s 2>/dev/null || echo "0")
+    cmd="$cmd | awk -v since=$since_ts 'BEGIN{} { ts=\$1; gsub(/[TZ]/, \" \", ts); if (mktime(ts) >= since) print }'"
+  fi
+
+  # Filter by pattern
+  if [[ -n "$filter" ]]; then
+    cmd="$cmd | grep -i '$filter'"
+  fi
+
+  # Tail
+  cmd="$cmd | tail -n $tail_n"
+
+  # Execute
+  for src in "${sources[@]}"; do
+    [[ -f "$src" ]] || continue
+    echo "=== $(basename "$src") ==="
+    eval "cat '$src' $cmd" 2>/dev/null || cat "$src" | tail -n "$tail_n" | { [[ -n "$filter" ]] && grep -i "$filter" || cat; }
+    echo ""
+  done
+}
+
+# ─── METRICS ─────────────────────────────────────────────────────────────────
+
+cmd_metrics() {
+  local metric_name="" since=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)  metric_name="$2"; shift 2 ;;
+      --since) since="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local metrics_file="$OBS_DIR/metrics/events.jsonl"
+
+  if [[ ! -f "$metrics_file" ]]; then
+    warn "No metrics recorded yet."
+    info "Agents can record metrics with: agent-observe record <event> <value>"
+    return 0
+  fi
+
+  info "Querying metrics (name='${metric_name:-all}', since='${since:-all}')"
+  echo ""
+
+  local query="cat '$metrics_file'"
+
+  if [[ -n "$metric_name" ]]; then
+    query="$query | jq -c 'select(.event == \"$metric_name\")'"
+  fi
+
+  if [[ -n "$since" ]]; then
+    local since_ts
+    since_ts=$(date -d "$since" +%s 2>/dev/null || echo "0")
+    query="$query | jq -c --argjson since $since_ts 'select(.ts >= \$since)'"
+  fi
+
+  eval "$query" | jq -r '"[\(.timestamp)] \(.event): \(.value) \(if .unit then "(\(.unit))" else "" end)"' 2>/dev/null \
+    || eval "$query"
+
+  echo ""
+
+  # Summary stats
+  echo "=== Summary ==="
+  if [[ -n "$metric_name" ]]; then
+    eval "cat '$metrics_file' | jq -c 'select(.event == \"$metric_name\") | .value | tonumber'" 2>/dev/null \
+      | awk 'BEGIN{n=0;sum=0;min=999999;max=0} {n++;sum+=$1; if($1<min)min=$1; if($1>max)max=$1} END{if(n>0) printf "count=%d avg=%.1f min=%.1f max=%.1f\n",n,sum/n,min,max}' \
+      || echo "(non-numeric values, no stats)"
+  fi
+}
+
+# ─── SCREENSHOT ──────────────────────────────────────────────────────────────
+
+cmd_screenshot() {
+  local url="http://localhost:3000" out_file=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url) url="$2"; shift 2 ;;
+      --out) out_file="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  if [[ -z "$out_file" ]]; then
+    out_file="$OBS_DIR/screenshots/screenshot-$(date +%Y%m%d-%H%M%S).png"
+  fi
+
+  mkdir -p "$(dirname "$out_file")"
+
+  info "Capturing screenshot: $url → $out_file"
+
+  # Try available screenshot tools
+  if command -v playwright &>/dev/null; then
+    node -e "
+const { chromium } = require('playwright');
+(async () => {
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  await page.goto('$url', { waitUntil: 'networkidle' });
+  await page.screenshot({ path: '$out_file', fullPage: true });
+  await browser.close();
+  console.log('Screenshot saved: $out_file');
+})().catch(e => { console.error(e.message); process.exit(1); });
+" && success "Screenshot saved: $out_file" && return 0
+  fi
+
+  if command -v puppeteer &>/dev/null || node -e "require('puppeteer')" 2>/dev/null; then
+    node -e "
+const puppeteer = require('puppeteer');
+(async () => {
+  const browser = await puppeteer.launch({ args: ['--no-sandbox'] });
+  const page = await browser.newPage();
+  await page.goto('$url', { waitUntil: 'networkidle2' });
+  await page.screenshot({ path: '$out_file', fullPage: true });
+  await browser.close();
+  console.log('Screenshot saved: $out_file');
+})().catch(e => { console.error(e.message); process.exit(1); });
+" && success "Screenshot saved: $out_file" && return 0
+  fi
+
+  # Fallback: curl to check if URL is reachable + save HTML snapshot
+  if curl -sf "$url" -o "$out_file.html" --max-time 10; then
+    warn "No headless browser available. Saved HTML snapshot instead: $out_file.html"
+    info "Install playwright for real screenshots: npm install -g playwright"
+  else
+    error "Cannot reach $url — is the application running?"
+    return 1
+  fi
+}
+
+# ─── TRACE ───────────────────────────────────────────────────────────────────
+
+cmd_trace() {
+  local task_id="${1:-}"
+  if [[ -z "$task_id" ]]; then
+    error "Usage: agent-observe trace <task-id>"
+    exit 1
+  fi
+
+  echo "=== Execution Trace: $task_id ==="
+  echo ""
+
+  # Plan file
+  local plan_file=""
+  for dir in active in-progress completed; do
+    [[ -f "$PROJECT_ROOT/plans/$dir/${task_id}.md" ]] && plan_file="$PROJECT_ROOT/plans/$dir/${task_id}.md" && break
+  done
+
+  if [[ -n "$plan_file" ]]; then
+    echo "--- Plan ---"
+    grep -A 999 "## Progress Log" "$plan_file" | head -30
+    echo ""
+    echo "--- Decisions ---"
+    grep -A 999 "## Decision Log" "$plan_file" | grep "^|" | grep -v "^| Date" | grep -v "^| ---"
+    echo ""
+  fi
+
+  # Session files
+  echo "--- Agent Sessions ---"
+  for session in "$AGENT_DIR/sessions/${task_id}"-*.json; do
+    [[ -f "$session" ]] || continue
+    local role status
+    role=$(jq -r '.role // "unknown"' "$session" 2>/dev/null)
+    status=$(jq -r '.status // "unknown"' "$session" 2>/dev/null)
+    echo "  $role: $status"
+  done
+  echo ""
+
+  # Logs
+  echo "--- Recent Logs ---"
+  for log in "$AGENT_DIR/logs/${task_id}"-*.log; do
+    [[ -f "$log" ]] || continue
+    echo "  $(basename "$log"):"
+    tail -5 "$log" | sed 's/^/    /'
+  done
+}
+
+# ─── HEALTH ──────────────────────────────────────────────────────────────────
+
+cmd_health() {
+  info "Checking application health..."
+  echo ""
+
+  local endpoints=(
+    "http://localhost:3000/health"
+    "http://localhost:3000/api/health"
+    "http://localhost:8080/health"
+    "http://localhost:3001/health"
+  )
+
+  local found=0
+  for ep in "${endpoints[@]}"; do
+    local status
+    status=$(curl -sf -o /dev/null -w "%{http_code}" "$ep" --max-time 3 2>/dev/null || echo "unreachable")
+    if [[ "$status" != "unreachable" ]]; then
+      found=1
+      if [[ "$status" == "200" ]]; then
+        success "$ep → $status"
+        # Try to get response body
+        curl -sf "$ep" --max-time 3 2>/dev/null | jq . 2>/dev/null || true
+      else
+        warn "$ep → $status"
+      fi
+    fi
+  done
+
+  if [[ $found -eq 0 ]]; then
+    warn "No health endpoints reachable. Is the application running?"
+  fi
+
+  echo ""
+
+  # Check daemon/watcher health
+  echo "--- Agent Infrastructure ---"
+  local daemon_pid_file="$AGENT_DIR/daemon.pid"
+  if [[ -f "$daemon_pid_file" ]] && ps -p "$(cat "$daemon_pid_file")" &>/dev/null; then
+    success "agent-daemon: running (PID $(cat "$daemon_pid_file"))"
+  else
+    warn "agent-daemon: not running"
+  fi
+
+  local watcher_pid_file="$AGENT_DIR/watcher.pid"
+  if [[ -f "$watcher_pid_file" ]] && ps -p "$(cat "$watcher_pid_file")" &>/dev/null; then
+    success "agent-watcher: running (PID $(cat "$watcher_pid_file"))"
+  else
+    warn "agent-watcher: not running"
+  fi
+}
+
+# ─── RECORD ──────────────────────────────────────────────────────────────────
+
+cmd_record() {
+  local event="${1:-}"
+  local value="${2:-}"
+  local unit="${3:-}"
+
+  if [[ -z "$event" ]]; then
+    error "Usage: agent-observe record <event> [value] [unit]"
+    exit 1
+  fi
+
+  init_obs
+  local metrics_file="$OBS_DIR/metrics/events.jsonl"
+
+  local entry
+  entry=$(jq -cn \
+    --arg event "$event" \
+    --arg value "$value" \
+    --arg unit "$unit" \
+    --arg timestamp "$(date -Iseconds)" \
+    --argjson ts "$(date +%s)" \
+    --arg task "${TASK_ID:-}" \
+    --arg role "${AGENT_ROLE:-}" \
+    '{event: $event, value: $value, unit: $unit, timestamp: $timestamp, ts: $ts, task_id: $task, agent_role: $role}')
+
+  echo "$entry" >> "$metrics_file"
+  success "Recorded: $event = $value${unit:+ $unit}"
+}
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  init_obs
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    logs)       cmd_logs "$@" ;;
+    metrics)    cmd_metrics "$@" ;;
+    screenshot) cmd_screenshot "$@" ;;
+    trace)      cmd_trace "$@" ;;
+    health)     cmd_health "$@" ;;
+    record)     cmd_record "$@" ;;
+    -h|--help|help) usage ;;
+    *)
+      error "Unknown command: $cmd"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
