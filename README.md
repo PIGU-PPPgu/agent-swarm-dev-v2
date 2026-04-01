@@ -40,6 +40,26 @@ See [SKILL.md](./SKILL.md) for complete documentation.
 2. **Knowledge lives in the repository, not in heads.**
 3. **Strict constraints = speed multipliers.**
 4. **Agent-to-agent communication through code, not chat.**
+5. **Automation by default. Manual intervention when needed.** (NEW!)
+
+## Automation Levels
+
+### Level 1: Manual (Original)
+- Human runs each agent script manually
+- Human monitors completion
+- Human triggers next phase
+
+### Level 2: Semi-Automatic (NEW!)
+- Agent daemon executes scripts automatically
+- File watcher detects completions
+- Next phase triggers automatically
+- Human monitors via dashboard
+
+### Level 3: Fully Automatic (NEW!)
+- GitHub Actions trigger agents on PR events
+- Agents communicate via PR comments
+- Automatic retries on failure
+- Human intervention only on escalation
 
 ## Agent Roles
 
@@ -178,6 +198,8 @@ openclaw gateway start
 
 ### Usage
 
+#### Manual Mode (Semi-Automatic)
+
 ```bash
 # 1. Initialize your project
 cd your-project
@@ -195,6 +217,51 @@ bash .agent-swarm/sessions/task-xxx-doc-gardener.sh
 # 4. Monitor progress
 agent-orchestrator status
 agent-orchestrator watch
+```
+
+#### Fully Automatic Mode (NEW!)
+
+```bash
+# 1. Start the agent daemon (runs in background)
+agent-daemon start
+
+# 2. Start the file watcher (monitors changes)
+agent-watcher start &
+
+# 3. Initiate a task
+agent-orchestrator run "Implement user authentication"
+
+# 4. Agents execute automatically!
+# - Design agent runs first
+# - Builder agent triggers after design completes
+# - Reviewer agent triggers when PR opens
+# - Doc gardener triggers after approval
+
+# 5. Monitor in real-time
+agent-orchestrator watch
+
+# Or check daemon logs
+agent-daemon logs
+```
+
+#### GitHub Actions Integration (NEW!)
+
+When you push to GitHub:
+
+1. **PR opened** → Reviewer agent spawns automatically
+2. **Changes requested** → Builder agent re-runs
+3. **PR approved** → Doc gardener updates docs
+4. **Quality checks** run on every PR
+
+Setup:
+```bash
+# Copy workflows to your project
+cp -r .github/workflows your-project/.github/
+
+# Commit and push
+git add .github/workflows
+git commit -m "Add agent swarm CI/CD"
+git push
 ```
 
 ## Why This Works

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Quick Start - Agent Swarm Automation
+# One command to start everything
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+
+# Colors
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${BLUE}🚀 Agent Swarm - Quick Start${NC}"
+echo ""
+
+# Check if already initialized
+if [[ ! -d "$PROJECT_ROOT/plans" ]]; then
+  echo -e "${YELLOW}⚠️  Project not initialized. Running harness init...${NC}"
+  "$SCRIPT_DIR/harness" init
+  echo ""
+fi
+
+# Start daemon
+echo -e "${BLUE}Starting agent daemon...${NC}"
+"$SCRIPT_DIR/agent-daemon" start
+echo ""
+
+# Start watcher in background
+echo -e "${BLUE}Starting file watcher...${NC}"
+nohup "$SCRIPT_DIR/agent-watcher" start > "$PROJECT_ROOT/.agent-swarm/logs/watcher.log" 2>&1 &
+WATCHER_PID=$!
+echo -e "${GREEN}✓${NC} Watcher started (PID: $WATCHER_PID)"
+echo ""
+
+# Show status
+echo -e "${BLUE}System Status:${NC}"
+"$SCRIPT_DIR/agent-daemon" status
+echo ""
+
+# Instructions
+echo -e "${GREEN}✓ Agent swarm automation is now running!${NC}"
+echo ""
+echo "Next steps:"
+echo "  1. Start a task:"
+echo "     agent-orchestrator run \"Your task description\""
+echo ""
+echo "  2. Monitor progress:"
+echo "     agent-orchestrator watch"
+echo ""
+echo "  3. Check logs:"
+echo "     agent-daemon logs"
+echo ""
+echo "To stop:"
+echo "  agent-daemon stop"
+echo "  kill $WATCHER_PID"
+echo ""

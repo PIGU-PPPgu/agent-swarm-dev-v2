@@ -1,0 +1,178 @@
+name: Agent Swarm - PR Trigger
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  trigger-reviewer:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install OpenClaw (if configured)
+        run: |
+          if [ -f ".openclaw/config.json" ]; then
+            npm install -g openclaw
+          fi
+      
+      - name: Check for agent orchestrator
+        id: check-orchestrator
+        run: |
+          if [ -f "bin/agent-orchestrator" ]; then
+            echo "orchestrator=true" >> $GITHUB_OUTPUT
+          else
+            echo "orchestrator=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Spawn Reviewer Agent
+        if: steps.check-orchestrator.outputs.orchestrator == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🤖 Spawning reviewer agent for PR #$PR_NUMBER"
+          
+          # Find task ID from PR body or title
+          TASK_ID=$(echo "$PR_TITLE" | grep -o 'task-[0-9]\{8\}-[0-9]\{6\}-[a-f0-9]\{6\}' || echo "")
+          
+          if [ -z "$TASK_ID" ]; then
+            echo "⚠️ No task ID found in PR title. Skipping agent spawn."
+            exit 0
+          fi
+          
+          echo "Task ID: $TASK_ID"
+          
+          # Update task plan with PR info
+          PLAN_FILE="plans/in-progress/${TASK_ID}.md"
+          
+          if [ -f "$PLAN_FILE" ]; then
+            sed -i "s/\*\*PR Number:\*\* TBD/\*\*PR Number:\*\* #$PR_NUMBER/" "$PLAN_FILE"
+            sed -i "s|\*\*PR URL:\*\* TBD|\*\*PR URL:\*\* ${{ github.event.pull_request.html_url }}|" "$PLAN_FILE"
+            
+            echo "✓ Updated plan file with PR information"
+            
+            # Trigger reviewer agent
+            if [ -f ".agent-swarm/sessions/${TASK_ID}-reviewer.json" ]; then
+              # Update session status to trigger execution
+              jq '.status = "active" | .pr_number = "'$PR_NUMBER'" | .triggered_by = "github-actions"' \
+                ".agent-swarm/sessions/${TASK_ID}-reviewer.json" > \
+                ".agent-swarm/sessions/${TASK_ID}-reviewer.json.tmp"
+              mv ".agent-swarm/sessions/${TASK_ID}-reviewer.json.tmp" \
+                ".agent-swarm/sessions/${TASK_ID}-reviewer.json"
+              
+              echo "✓ Triggered reviewer agent"
+            else
+              echo "⚠️ Reviewer session not found. Creating new one..."
+              
+              # Create reviewer session
+              cat > ".agent-swarm/sessions/${TASK_ID}-reviewer.json" << EOF
+{
+  "role": "reviewer",
+  "task_id": "$TASK_ID",
+  "context": "PR #$PR_NUMBER review",
+  "plan_file": "$PLAN_FILE",
+  "pr_number": "$PR_NUMBER",
+  "spawned_at": "$(date -Iseconds)",
+  "triggered_by": "github-actions",
+  "status": "active"
+}
+EOF
+              
+              echo "✓ Created reviewer session"
+            fi
+          else
+            echo "⚠️ Plan file not found: $PLAN_FILE"
+          fi
+      
+      - name: Comment on PR
+        if: steps.check-orchestrator.outputs.orchestrator == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '🤖 **Agent Swarm Activated**\n\nReviewer agent has been spawned to review this PR.\n\nThe agent will:\n- Run quality checks (`/harness audit`)\n- Verify architecture compliance\n- Check test coverage\n- Review for security issues\n\nReview results will be posted shortly.'
+            })
+  
+  handle-review-feedback:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request_review'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Check review status
+        id: check-review
+        env:
+          REVIEW_STATE: ${{ github.event.review.state }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "Review state: $REVIEW_STATE"
+          echo "state=$REVIEW_STATE" >> $GITHUB_OUTPUT
+      
+      - name: Trigger Builder Agent (if changes requested)
+        if: steps.check-review.outputs.state == 'changes_requested'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+        run: |
+          echo "🔄 Changes requested on PR #$PR_NUMBER"
+          echo "Triggering builder agent to address feedback..."
+          
+          # Find task ID
+          TASK_ID=$(git log --oneline | grep -o 'task-[0-9]\{8\}-[0-9]\{6\}-[a-f0-9]\{6\}' | head -1 || echo "")
+          
+          if [ -n "$TASK_ID" ]; then
+            # Update builder session to address feedback
+            if [ -f ".agent-swarm/sessions/${TASK_ID}-builder.json" ]; then
+              jq '.status = "active" | .feedback = "'"$REVIEW_BODY"'" | .iteration = (.iteration // 0) + 1' \
+                ".agent-swarm/sessions/${TASK_ID}-builder.json" > \
+                ".agent-swarm/sessions/${TASK_ID}-builder.json.tmp"
+              mv ".agent-swarm/sessions/${TASK_ID}-builder.json.tmp" \
+                ".agent-swarm/sessions/${TASK_ID}-builder.json"
+              
+              echo "✓ Builder agent triggered to address feedback"
+            fi
+          fi
+      
+      - name: Mark as approved
+        if: steps.check-review.outputs.state == 'approved'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "✅ PR #$PR_NUMBER approved"
+          echo "Triggering doc gardener agent..."
+          
+          # Find task ID
+          TASK_ID=$(git log --oneline | grep -o 'task-[0-9]\{8\}-[0-9]\{6\}-[a-f0-9]\{6\}' | head -1 || echo "")
+          
+          if [ -n "$TASK_ID" ]; then
+            # Trigger doc gardener
+            if [ -f ".agent-swarm/sessions/${TASK_ID}-doc-gardener.json" ]; then
+              jq '.status = "active" | .triggered_by = "github-actions-approval"' \
+                ".agent-swarm/sessions/${TASK_ID}-doc-gardener.json" > \
+                ".agent-swarm/sessions/${TASK_ID}-doc-gardener.json.tmp"
+              mv ".agent-swarm/sessions/${TASK_ID}-doc-gardener.json.tmp" \
+                ".agent-swarm/sessions/${TASK_ID}-doc-gardener.json"
+              
+              echo "✓ Doc gardener agent triggered"
+            fi
+          fi

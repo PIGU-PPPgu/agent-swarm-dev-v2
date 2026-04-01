@@ -6,6 +6,36 @@
 
 This skill enables multiple AI agents to collaborate on software projects with minimal human intervention. Based on OpenAI's experience building a 1M+ LOC product with 3 engineers and AI agents in 5 months.
 
+**NEW: Now supports fully automatic execution!** Agents can run autonomously with daemon + file watcher + GitHub Actions integration.
+
+## Automation Levels
+
+### Level 1: Manual (Original)
+- Human runs each agent script manually
+- Human monitors completion
+- Human triggers next phase
+
+### Level 2: Semi-Automatic (NEW!)
+- `agent-daemon` executes scripts automatically
+- `agent-watcher` detects completions
+- Next phase triggers automatically
+- Human monitors via dashboard
+
+### Level 3: Fully Automatic (NEW!)
+- GitHub Actions trigger agents on PR events
+- Agents communicate via PR comments
+- Automatic retries on failure
+- Human intervention only on escalation
+
+**Quick Start (Automatic Mode):**
+```bash
+agent-swarm-start  # Starts daemon + watcher
+agent-orchestrator run "Your task"
+agent-orchestrator watch  # Monitor progress
+```
+
+See [docs/AUTOMATION.md](./docs/AUTOMATION.md) for complete automation guide.
+
 ## Core Principles
 
 1. **Humans steer. Agents execute.**
