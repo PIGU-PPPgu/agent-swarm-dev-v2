@@ -8,21 +8,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 PLANS_DIR="$PROJECT_ROOT/plans"
 AGENT_DIR="$PROJECT_ROOT/.agent-swarm"
+STATE_DIR="$AGENT_DIR/state"
+LOCKS_DIR="$AGENT_DIR/locks"
+
 WATCHER_LOG="$AGENT_DIR/logs/watcher.log"
+WATCHER_PID_FILE="$AGENT_DIR/watcher.pid"
+WATCHER_LOCK_FILE="$STATE_DIR/watcher.lock"
+WATCHER_HEALTH_FILE="$STATE_DIR/watcher-heartbeat.json"
+WATCHER_ACTIVITY_FILE="$STATE_DIR/watcher-last-activity.txt"
+WATCHER_RESTART_COUNT_FILE="$STATE_DIR/watcher-restart-count.txt"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
-NC='\033[0m'
+COMPONENT="agent-watcher"
+LOCK_WAIT_SECONDS=30
+HEALTH_STALE_SECONDS=60
+WATCHER_BACKOFF_SECONDS=5
+HEARTBEAT_INTERVAL=15
 
-info() { echo -e "${BLUE}ℹ${NC} $*" | tee -a "$WATCHER_LOG"; }
-success() { echo -e "${GREEN}✓${NC} $*" | tee -a "$WATCHER_LOG"; }
-warn() { echo -e "${YELLOW}⚠${NC} $*" | tee -a "$WATCHER_LOG"; }
-error() { echo -e "${RED}✗${NC} $*" | tee -a "$WATCHER_LOG"; }
-event() { echo -e "${MAGENTA}📡${NC} $*" | tee -a "$WATCHER_LOG"; }
+PROCESS_LOCK_FD=""
+PROCESS_LOCK_DIR=""
+WATCHER_CHILD_PID=""
+HEARTBEAT_PID=""
+WATCHER_SHUTDOWN_REQUESTED=0
+WATCHER_RESTART_COUNT=0
 
 usage() {
   cat << EOF
@@ -33,19 +40,22 @@ Usage: agent-watcher <command>
 Commands:
   start       Start watching for file changes
   stop        Stop the watcher
+  restart     Restart the watcher
   status      Check watcher status
+  health      Print watcher health JSON
   test        Test file change detection
+  logs        Tail watcher logs
 
 The watcher monitors:
   - plans/ directory for task updates
   - .agent-swarm/sessions/ for agent status changes
-  - Git repository for new commits/PRs
+  - .agent-swarm/logs/ for completion signals
 
-When changes detected:
-  - Parse completion signals from plan files
-  - Update agent session status
+When changes are detected:
+  - Parse completion signals using regex
+  - Update agent session status safely under file lock
   - Trigger next phase agents
-  - Send notifications
+  - Automatically restart the watcher backend if it crashes
 
 Dependencies:
   - fswatch (macOS): brew install fswatch
@@ -54,59 +64,376 @@ Dependencies:
 EOF
 }
 
-# Detect file watcher tool
-detect_watcher() {
-  if command -v fswatch &> /dev/null; then
-    echo "fswatch"
-  elif command -v inotifywait &> /dev/null; then
-    echo "inotify"
-  else
-    echo "none"
+init_watcher() {
+  mkdir -p "$AGENT_DIR/logs" "$STATE_DIR" "$LOCKS_DIR"
+  touch "$WATCHER_LOG"
+  if [[ ! -f "$WATCHER_RESTART_COUNT_FILE" ]]; then
+    printf '0\n' > "$WATCHER_RESTART_COUNT_FILE"
   fi
 }
 
-# Install watcher if missing
+json_log() {
+  local level="$1"
+  local event_name="$2"
+  local message="$3"
+  local payload
+
+  payload="$(jq -cn \
+    --arg timestamp "$(date -Iseconds)" \
+    --arg level "$level" \
+    --arg component "$COMPONENT" \
+    --arg event "$event_name" \
+    --arg message "$message" \
+    --arg pid "$$" \
+    '{
+      timestamp: $timestamp,
+      level: $level,
+      component: $component,
+      event: $event,
+      message: $message,
+      pid: ($pid | tonumber)
+    }'
+  )"
+
+  printf '%s\n' "$payload" >> "$WATCHER_LOG"
+  if [[ -t 1 ]]; then
+    printf '%s\n' "$payload"
+  fi
+}
+
+info() { json_log "INFO" "$1" "${2:-$1}"; }
+success() { json_log "INFO" "$1" "${2:-$1}"; }
+warn() { json_log "WARN" "$1" "${2:-$1}"; }
+error() { json_log "ERROR" "$1" "${2:-$1}"; }
+event() { json_log "INFO" "$1" "${2:-$1}"; }
+
+write_json_file() {
+  local target="$1"
+  local content="$2"
+  local tmp_file="${target}.$$.$RANDOM.tmp"
+
+  printf '%s\n' "$content" > "$tmp_file"
+  mv "$tmp_file" "$target"
+}
+
+touch_activity() {
+  printf '%s\n' "$(date -Iseconds)" > "$WATCHER_ACTIVITY_FILE"
+}
+
+write_health() {
+  local state="$1"
+  local message="$2"
+  local activity_at=""
+  local restart_count="0"
+
+  if [[ -f "$WATCHER_ACTIVITY_FILE" ]]; then
+    activity_at="$(cat "$WATCHER_ACTIVITY_FILE" 2>/dev/null || true)"
+  fi
+
+  if [[ -f "$WATCHER_RESTART_COUNT_FILE" ]]; then
+    restart_count="$(cat "$WATCHER_RESTART_COUNT_FILE" 2>/dev/null || echo 0)"
+  fi
+
+  write_json_file "$WATCHER_HEALTH_FILE" "$(jq -cn \
+    --arg component "$COMPONENT" \
+    --arg state "$state" \
+    --arg message "$message" \
+    --arg timestamp "$(date -Iseconds)" \
+    --arg heartbeat_epoch "$(date +%s)" \
+    --arg pid "$$" \
+    --arg restart_count "$restart_count" \
+    --arg activity_at "$activity_at" \
+    '{
+      component: $component,
+      state: $state,
+      message: $message,
+      timestamp: $timestamp,
+      heartbeat_epoch: ($heartbeat_epoch | tonumber),
+      pid: ($pid | tonumber),
+      restart_count: ($restart_count | tonumber),
+      last_activity_at: (if $activity_at == "" then null else $activity_at end)
+    }'
+  )"
+}
+
+heartbeat_loop() {
+  while true; do
+    write_health "running" "Watcher supervisor active"
+    sleep "$HEARTBEAT_INTERVAL"
+  done
+}
+
+set_restart_count() {
+  printf '%s\n' "$1" > "$WATCHER_RESTART_COUNT_FILE"
+}
+
+sanitize_lock_name() {
+  printf '%s' "$1" | tr '/: ' '___' | tr -cs 'A-Za-z0-9._-' '_'
+}
+
+lock_file_for() {
+  local resource="$1"
+  printf '%s/%s.lock' "$LOCKS_DIR" "$(sanitize_lock_name "$resource")"
+}
+
+cleanup_stale_lock_dir() {
+  local lock_dir="$1"
+  local pid_file="$lock_dir/pid"
+
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$lock_dir"
+    fi
+  fi
+}
+
+acquire_dir_lock() {
+  local lock_file="$1"
+  local lock_dir="${lock_file}.d"
+  local deadline=$((SECONDS + LOCK_WAIT_SECONDS))
+
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    cleanup_stale_lock_dir "$lock_dir"
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 1
+  done
+
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  PROCESS_LOCK_DIR="$lock_dir"
+  return 0
+}
+
+acquire_process_lock() {
+  local lock_file="$1"
+
+  if command -v flock >/dev/null 2>&1; then
+    exec {PROCESS_LOCK_FD}> "$lock_file"
+    if ! flock -n "$PROCESS_LOCK_FD"; then
+      exec {PROCESS_LOCK_FD}>&-
+      PROCESS_LOCK_FD=""
+      return 1
+    fi
+    printf '%s\n' "$$" > "$WATCHER_PID_FILE"
+    return 0
+  fi
+
+  if ! acquire_dir_lock "$lock_file"; then
+    return 1
+  fi
+
+  printf '%s\n' "$$" > "$WATCHER_PID_FILE"
+  return 0
+}
+
+release_process_lock() {
+  if [[ -n "$PROCESS_LOCK_FD" ]]; then
+    flock -u "$PROCESS_LOCK_FD" 2>/dev/null || true
+    exec {PROCESS_LOCK_FD}>&-
+    PROCESS_LOCK_FD=""
+  fi
+
+  if [[ -n "$PROCESS_LOCK_DIR" ]]; then
+    rm -rf "$PROCESS_LOCK_DIR"
+    PROCESS_LOCK_DIR=""
+  fi
+}
+
+with_path_lock() {
+  local resource="$1"
+  shift
+
+  local lock_file
+  lock_file="$(lock_file_for "$resource")"
+  local lock_dir="${lock_file}.d"
+  local deadline=$((SECONDS + LOCK_WAIT_SECONDS))
+
+  if command -v flock >/dev/null 2>&1; then
+    local lock_fd
+    exec {lock_fd}> "$lock_file"
+    if ! flock -w "$LOCK_WAIT_SECONDS" "$lock_fd"; then
+      exec {lock_fd}>&-
+      error "lock_timeout" "Timed out waiting for lock: $resource"
+      return 1
+    fi
+    "$@"
+    local rc=$?
+    flock -u "$lock_fd" 2>/dev/null || true
+    exec {lock_fd}>&-
+    return $rc
+  fi
+
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    cleanup_stale_lock_dir "$lock_dir"
+    if (( SECONDS >= deadline )); then
+      error "lock_timeout" "Timed out waiting for lock: $resource"
+      return 1
+    fi
+    sleep 1
+  done
+
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  "$@"
+  local rc=$?
+  rm -rf "$lock_dir"
+  return $rc
+}
+
+is_running() {
+  if [[ -f "$WATCHER_PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$WATCHER_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$WATCHER_PID_FILE"
+  fi
+  return 1
+}
+
+detect_watcher() {
+  if command -v fswatch >/dev/null 2>&1; then
+    echo "fswatch"
+  elif command -v inotifywait >/dev/null 2>&1; then
+    echo "inotify"
+  else
+    echo "poll"
+  fi
+}
+
 install_watcher() {
-  local os=$(uname -s)
-  
+  local os
+  os="$(uname -s)"
+
   case "$os" in
     Darwin)
-      if ! command -v fswatch &> /dev/null; then
-        warn "fswatch not found. Installing via Homebrew..."
-        brew install fswatch || {
-          error "Failed to install fswatch. Please install manually: brew install fswatch"
-          return 1
-        }
+      if ! command -v fswatch >/dev/null 2>&1; then
+        warn "watcher_dependency_missing" "fswatch not found. Install with: brew install fswatch"
+        return 1
       fi
       ;;
     Linux)
-      if ! command -v inotifywait &> /dev/null; then
-        warn "inotify-tools not found. Installing..."
-        if command -v apt &> /dev/null; then
-          sudo apt install -y inotify-tools
-        elif command -v yum &> /dev/null; then
-          sudo yum install -y inotify-tools
-        else
-          error "Cannot install inotify-tools automatically. Please install manually."
-          return 1
-        fi
+      if ! command -v inotifywait >/dev/null 2>&1; then
+        warn "watcher_dependency_missing" "inotifywait not found. Install with: apt install inotify-tools"
+        return 1
       fi
       ;;
     *)
-      error "Unsupported OS: $os"
+      warn "watcher_dependency_missing" "Unsupported OS for auto watcher selection: $os"
       return 1
       ;;
   esac
 }
 
-# Handle file change event
+parse_completion_signal() {
+  local source_file="$1"
+
+  perl -ne '
+    while (/(DESIGN|BUILD|REVIEW|DOC)[ _-]*COMPLETE(?:\s*[:=-]?\s*(?:\[(APPROVED|CHANGES_REQUESTED)\]|(APPROVED|CHANGES_REQUESTED)|(PR\s*#?\s*([0-9]+))))?/ig) {
+      $signal = uc($1) . "_COMPLETE";
+      $review = uc($2 || $3 || "");
+      $pr = $5 || "";
+    }
+    END {
+      if ($signal) {
+        print join("\t", $signal, $pr, $review);
+        exit 0;
+      }
+      exit 1;
+    }
+  ' "$source_file"
+}
+
+update_session_triggered_locked() {
+  local session_file="$1"
+  local triggered_at="$2"
+  local tmp_file="${session_file}.$$.$RANDOM.tmp"
+
+  jq \
+    --arg triggered_at "$triggered_at" \
+    'if .status == "completed" or .status == "running" then .
+     else .status = "active" | .triggered_at = $triggered_at
+     end' \
+    "$session_file" > "$tmp_file"
+  mv "$tmp_file" "$session_file"
+}
+
+mark_session_triggered() {
+  local session_file="$1"
+  local triggered_at="$2"
+  with_path_lock "$session_file" update_session_triggered_locked "$session_file" "$triggered_at"
+}
+
+update_session_completed_locked() {
+  local session_file="$1"
+  local completed_at="$2"
+  local signal="$3"
+  local pr_number="$4"
+  local review_result="$5"
+  local tmp_file="${session_file}.$$.$RANDOM.tmp"
+
+  jq \
+    --arg completed_at "$completed_at" \
+    --arg signal "$signal" \
+    --arg pr_number "$pr_number" \
+    --arg review_result "$review_result" \
+    '.status = "completed"
+      | .completed_at = $completed_at
+      | .completion_signal = $signal
+      | .timed_out = false
+      | (if $pr_number == "" then del(.pr_number) else .pr_number = ($pr_number | tonumber) end)
+      | (if $review_result == "" then del(.review_result) else .review_result = $review_result end)' \
+    "$session_file" > "$tmp_file"
+  mv "$tmp_file" "$session_file"
+}
+
+mark_session_completed() {
+  local session_file="$1"
+  local completed_at="$2"
+  local signal="$3"
+  local pr_number="$4"
+  local review_result="$5"
+  with_path_lock "$session_file" update_session_completed_locked "$session_file" "$completed_at" "$signal" "$pr_number" "$review_result"
+}
+
+update_session_failed_locked() {
+  local session_file="$1"
+  local failed_at="$2"
+  local exit_code="$3"
+  local error_message="$4"
+  local tmp_file="${session_file}.$$.$RANDOM.tmp"
+
+  jq \
+    --arg failed_at "$failed_at" \
+    --arg error_message "$error_message" \
+    --argjson exit_code "$exit_code" \
+    '.status = "failed"
+      | .failed_at = $failed_at
+      | .exit_code = $exit_code
+      | .error = $error_message' \
+    "$session_file" > "$tmp_file"
+  mv "$tmp_file" "$session_file"
+}
+
+mark_session_failed() {
+  local session_file="$1"
+  local failed_at="$2"
+  local exit_code="$3"
+  local error_message="$4"
+  with_path_lock "$session_file" update_session_failed_locked "$session_file" "$failed_at" "$exit_code" "$error_message"
+}
+
 handle_change() {
   local file="$1"
   local event_type="${2:-modified}"
-  
-  event "File changed: $file ($event_type)"
-  
-  # Determine file type and handle accordingly
+
+  touch_activity
+  write_health "running" "Processing $event_type on $file"
+  event "file_change" "File changed: $file ($event_type)"
+
   case "$file" in
     */plans/active/*.md)
       handle_plan_change "$file" "active"
@@ -126,108 +453,131 @@ handle_change() {
   esac
 }
 
-# Handle plan file changes
+phase_completed() {
+  local file="$1"
+  local phase_number="$2"
+  grep -Eq "Phase[[:space:]]*${phase_number}.*\\[[xX]\\]" "$file" 2>/dev/null
+}
+
 handle_plan_change() {
   local file="$1"
   local stage="$2"
-  local task_id=$(basename "$file" .md)
-  
-  info "Plan updated: $task_id ($stage)"
-  
-  # Check for phase completions
-  if grep -q "Phase 1.*\[x\]" "$file" 2>/dev/null; then
-    success "Phase 1 (Design) completed for $task_id"
-    # Check if builder agent should start
+  local task_id
+  task_id="$(basename "$file" .md)"
+
+  info "plan_change" "Plan updated: $task_id ($stage)"
+
+  if phase_completed "$file" 1; then
+    success "phase_complete" "Phase 1 (Design) completed for $task_id"
     check_and_trigger_agent "$task_id" "builder"
   fi
-  
-  if grep -q "Phase 2.*\[x\]" "$file" 2>/dev/null; then
-    success "Phase 2 (Implementation) completed for $task_id"
-    # Check if reviewer agent should start
+
+  if phase_completed "$file" 2; then
+    success "phase_complete" "Phase 2 (Implementation) completed for $task_id"
     check_and_trigger_agent "$task_id" "reviewer"
   fi
-  
-  if grep -q "Phase 3.*\[x\]" "$file" 2>/dev/null; then
-    success "Phase 3 (Review) completed for $task_id"
-    # Check if doc-gardener should start
+
+  if phase_completed "$file" 3; then
+    success "phase_complete" "Phase 3 (Review) completed for $task_id"
     check_and_trigger_agent "$task_id" "doc-gardener"
   fi
-  
-  if grep -q "Phase 4.*\[x\]" "$file" 2>/dev/null; then
-    success "Phase 4 (Integration) completed for $task_id"
-    success "Task $task_id fully completed!"
+
+  if phase_completed "$file" 4; then
+    success "task_complete" "Task $task_id fully completed"
   fi
-  
-  # Check for PR information
-  local pr_num=$(grep "**PR Number:**" "$file" | sed 's/.*: //' | grep -v "TBD" || echo "")
+
+  local pr_num=""
+  pr_num="$(grep -E '^\*\*PR Number:\*\*' "$file" 2>/dev/null | sed 's/.*: //' | grep -v 'TBD' || true)"
   if [[ -n "$pr_num" ]]; then
-    info "PR opened: #$pr_num for task $task_id"
+    info "plan_pr_detected" "PR opened for task $task_id: #$pr_num"
   fi
 }
 
-# Handle session file changes
 handle_session_change() {
   local file="$1"
-  
-  if [[ ! -f "$file" ]]; then
-    return
-  fi
-  
-  local role=$(jq -r '.role' "$file" 2>/dev/null || echo "unknown")
-  local task_id=$(jq -r '.task_id' "$file" 2>/dev/null || echo "unknown")
-  local status=$(jq -r '.status' "$file" 2>/dev/null || echo "unknown")
-  
+
+  [[ -f "$file" ]] || return 0
+
+  local role
+  role="$(jq -r '.role // "unknown"' "$file" 2>/dev/null || echo "unknown")"
+  local task_id
+  task_id="$(jq -r '.task_id // "unknown"' "$file" 2>/dev/null || echo "unknown")"
+  local status
+  status="$(jq -r '.status // "unknown"' "$file" 2>/dev/null || echo "unknown")"
+
   case "$status" in
     completed)
-      success "$role agent completed for task $task_id"
+      success "session_complete" "$role agent completed for task $task_id"
       ;;
     failed)
-      error "$role agent failed for task $task_id"
-      # TODO: Implement retry logic
+      error "session_failed" "$role agent failed for task $task_id"
       ;;
     running)
-      info "$role agent running for task $task_id"
+      info "session_running" "$role agent running for task $task_id"
+      ;;
+    active)
+      info "session_active" "$role agent queued for task $task_id"
       ;;
   esac
 }
 
-# Handle log file changes
+sync_log_signal_to_session() {
+  local log_file="$1"
+  local signal="$2"
+  local pr_number="$3"
+  local review_result="$4"
+  local base_name
+  base_name="$(basename "$log_file" .log)"
+  local session_file="$AGENT_DIR/sessions/${base_name}.json"
+
+  if [[ ! -f "$session_file" ]]; then
+    return 0
+  fi
+
+  local status
+  status="$(jq -r '.status // "unknown"' "$session_file" 2>/dev/null || echo "unknown")"
+  if [[ "$status" == "completed" ]]; then
+    return 0
+  fi
+
+  mark_session_completed "$session_file" "$(date -Iseconds)" "$signal" "$pr_number" "$review_result"
+}
+
 handle_log_change() {
   local file="$1"
-  
-  # Check for completion signals in logs
-  if tail -1 "$file" | grep -q "DESIGN_COMPLETE\|BUILD_COMPLETE\|REVIEW_COMPLETE\|DOC_COMPLETE"; then
-    local signal=$(tail -1 "$file" | grep -o "[A-Z_]*_COMPLETE")
-    success "Completion signal detected: $signal"
+  [[ -f "$file" ]] || return 0
+
+  local completion_data=""
+  if completion_data="$(parse_completion_signal "$file" 2>/dev/null)"; then
+    local signal
+    signal="$(printf '%s' "$completion_data" | cut -f1)"
+    local pr_number
+    pr_number="$(printf '%s' "$completion_data" | cut -f2)"
+    local review_result
+    review_result="$(printf '%s' "$completion_data" | cut -f3)"
+
+    success "log_completion_signal" "Completion signal detected in $(basename "$file"): $signal"
+    sync_log_signal_to_session "$file" "$signal" "$pr_number" "$review_result"
   fi
 }
 
-# Check and trigger next agent
 check_and_trigger_agent() {
   local task_id="$1"
   local role="$2"
-  
   local session_file="$AGENT_DIR/sessions/${task_id}-${role}.json"
-  
+
   if [[ ! -f "$session_file" ]]; then
-    warn "Session file not found: $session_file"
+    warn "session_missing" "Session file not found: $session_file"
     return 1
   fi
-  
-  local status=$(jq -r '.status' "$session_file")
-  
-  if [[ "$status" == "active" ]]; then
-    info "Triggering $role agent for task $task_id..."
-    # Update status to trigger daemon execution
-    jq '.status = "active" | .triggered_at = "'$(date -Iseconds)'"' "$session_file" > "$session_file.tmp"
-    mv "$session_file.tmp" "$session_file"
-  fi
+
+  mark_session_triggered "$session_file" "$(date -Iseconds)"
+  info "agent_trigger" "Triggered $role agent for task $task_id"
 }
 
-# Watch using fswatch (macOS)
 watch_fswatch() {
-  info "Starting fswatch on $PROJECT_ROOT..."
-  
+  info "watcher_backend_start" "Starting fswatch on $PROJECT_ROOT"
+
   fswatch -r \
     --event Created \
     --event Updated \
@@ -237,64 +587,45 @@ watch_fswatch() {
     "$AGENT_DIR/sessions" \
     "$AGENT_DIR/logs" \
     2>/dev/null | while read -r file; do
-    handle_change "$file"
-  done
+      handle_change "$file"
+    done
 }
 
-# Watch using inotify (Linux)
 watch_inotify() {
-  info "Starting inotifywait on $PROJECT_ROOT..."
-  
+  info "watcher_backend_start" "Starting inotifywait on $PROJECT_ROOT"
+
   inotifywait -m -r \
     -e modify,create,delete,move \
     "$PLANS_DIR" \
     "$AGENT_DIR/sessions" \
     "$AGENT_DIR/logs" \
-    2>/dev/null | while read -r path event file; do
-    handle_change "$path$file" "$event"
-  done
+    2>/dev/null | while read -r path event_type file; do
+      handle_change "$path$file" "$event_type"
+    done
 }
 
-# Fallback: polling-based watch
 watch_poll() {
-  warn "No file watcher available. Using polling (slower)..."
-  
-  local last_check=$(date +%s)
-  
+  warn "watcher_backend_poll" "No event watcher available. Using polling mode"
+
+  local sentinel="$STATE_DIR/watcher-poll.sentinel"
+  touch "$sentinel"
+
   while true; do
-    local current=$(date +%s)
-    
-    # Check for modified files in last 10 seconds
     find "$PLANS_DIR" "$AGENT_DIR/sessions" "$AGENT_DIR/logs" \
       -type f \
-      -newermt "@$last_check" \
+      -newer "$sentinel" \
       2>/dev/null | while read -r file; do
-      handle_change "$file" "modified"
-    done
-    
-    last_check=$current
+        handle_change "$file" "modified"
+      done
+
+    touch "$sentinel"
     sleep 10
   done
 }
 
-# Start watcher
-cmd_start() {
-  mkdir -p "$AGENT_DIR/logs"
-  touch "$WATCHER_LOG"
-  
-  local watcher=$(detect_watcher)
-  
-  if [[ "$watcher" == "none" ]]; then
-    warn "No file watcher found. Attempting to install..."
-    install_watcher || {
-      error "Cannot install file watcher. Falling back to polling."
-      watcher="poll"
-    }
-    watcher=$(detect_watcher)
-  fi
-  
-  info "Using watcher: $watcher"
-  
+run_watcher_backend() {
+  local watcher="$1"
+
   case "$watcher" in
     fswatch)
       watch_fswatch
@@ -308,34 +639,201 @@ cmd_start() {
   esac
 }
 
-# Test watcher
-cmd_test() {
-  info "Testing file change detection..."
-  
-  local test_file="$AGENT_DIR/test-$(date +%s).txt"
-  
-  echo "Test file" > "$test_file"
-  sleep 1
-  echo "Modified" >> "$test_file"
-  sleep 1
-  rm "$test_file"
-  
-  success "Test complete. Check logs: $WATCHER_LOG"
+request_shutdown() {
+  WATCHER_SHUTDOWN_REQUESTED=1
+  if [[ -n "$WATCHER_CHILD_PID" ]]; then
+    kill "$WATCHER_CHILD_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$HEARTBEAT_PID" ]]; then
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+  fi
 }
 
-# Main
+cleanup_watcher() {
+  request_shutdown
+  if [[ -n "$WATCHER_CHILD_PID" ]]; then
+    wait "$WATCHER_CHILD_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$HEARTBEAT_PID" ]]; then
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+  fi
+  write_health "stopped" "Watcher stopped"
+  rm -f "$WATCHER_PID_FILE"
+  release_process_lock
+}
+
+watcher_supervisor_loop() {
+  init_watcher
+
+  if ! acquire_process_lock "$WATCHER_LOCK_FILE"; then
+    warn "lock_held" "Watcher already running; refusing to start a second instance"
+    exit 1
+  fi
+
+  trap 'cleanup_watcher; exit 0' INT TERM EXIT
+
+  local watcher
+  watcher="$(detect_watcher)"
+  if [[ "$watcher" != "poll" ]]; then
+    install_watcher || watcher="poll"
+  fi
+
+  info "watcher_start" "Watcher supervisor started with backend $watcher"
+  touch_activity
+  set_restart_count "$WATCHER_RESTART_COUNT"
+  write_health "running" "Watcher supervisor active"
+
+  heartbeat_loop &
+  HEARTBEAT_PID=$!
+
+  while (( WATCHER_SHUTDOWN_REQUESTED == 0 )); do
+    run_watcher_backend "$watcher" &
+    WATCHER_CHILD_PID=$!
+
+    local rc=0
+    if ! wait "$WATCHER_CHILD_PID"; then
+      rc=$?
+    fi
+    WATCHER_CHILD_PID=""
+
+    if (( WATCHER_SHUTDOWN_REQUESTED != 0 )); then
+      break
+    fi
+
+    WATCHER_RESTART_COUNT=$((WATCHER_RESTART_COUNT + 1))
+    set_restart_count "$WATCHER_RESTART_COUNT"
+    error "watcher_backend_exit" "Watcher backend exited unexpectedly with code $rc; restarting in ${WATCHER_BACKOFF_SECONDS}s"
+    write_health "degraded" "Watcher backend crashed with code $rc; restart #$WATCHER_RESTART_COUNT"
+    sleep "$WATCHER_BACKOFF_SECONDS"
+  done
+}
+
+cmd_start() {
+  init_watcher
+
+  if is_running; then
+    warn "watcher_running" "Watcher already running with PID $(cat "$WATCHER_PID_FILE")"
+    return 0
+  fi
+
+  watcher_supervisor_loop
+}
+
+cmd_stop() {
+  if ! is_running; then
+    warn "watcher_not_running" "Watcher not running"
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "$WATCHER_PID_FILE")"
+  info "watcher_stop" "Stopping watcher PID $pid"
+
+  kill "$pid" 2>/dev/null || true
+
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && (( waited < 10 )); do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+
+  rm -f "$WATCHER_PID_FILE"
+  write_health "stopped" "Watcher stopped by command"
+  success "watcher_stopped" "Watcher stopped"
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  cmd_start
+}
+
+cmd_status() {
+  if ! is_running; then
+    warn "watcher_status" "Watcher not running"
+    return 1
+  fi
+
+  local pid
+  pid="$(cat "$WATCHER_PID_FILE")"
+  local status_message="Watcher running with PID $pid"
+
+  if [[ -f "$WATCHER_HEALTH_FILE" ]]; then
+    local heartbeat_epoch
+    heartbeat_epoch="$(jq -r '.heartbeat_epoch // 0' "$WATCHER_HEALTH_FILE" 2>/dev/null || echo 0)"
+    local age=$(( $(date +%s) - heartbeat_epoch ))
+    if (( age > HEALTH_STALE_SECONDS )); then
+      warn "watcher_status" "$status_message (health stale: ${age}s)"
+      return 1
+    fi
+  fi
+
+  success "watcher_status" "$status_message"
+}
+
+cmd_health() {
+  if [[ ! -f "$WATCHER_HEALTH_FILE" ]]; then
+    error "watcher_health_missing" "No watcher health file found"
+    return 1
+  fi
+
+  cat "$WATCHER_HEALTH_FILE"
+}
+
+cmd_logs() {
+  if [[ ! -f "$WATCHER_LOG" ]]; then
+    warn "watcher_logs_missing" "No watcher logs found"
+    return 1
+  fi
+
+  tail -f "$WATCHER_LOG"
+}
+
+cmd_test() {
+  init_watcher
+  info "watcher_test" "Testing file change detection"
+
+  local test_file="$AGENT_DIR/test-$(date +%s).txt"
+  printf 'Test file\n' > "$test_file"
+  sleep 1
+  printf 'Modified\n' >> "$test_file"
+  sleep 1
+  rm -f "$test_file"
+
+  success "watcher_test_complete" "Test complete. Check logs: $WATCHER_LOG"
+}
+
 main() {
   if [[ $# -eq 0 ]]; then
     usage
     exit 0
   fi
-  
+
   local command="$1"
-  shift
-  
+  shift || true
+
   case "$command" in
     start)
       cmd_start
+      ;;
+    stop)
+      cmd_stop
+      ;;
+    restart)
+      cmd_restart
+      ;;
+    status)
+      cmd_status
+      ;;
+    health)
+      cmd_health
+      ;;
+    logs)
+      cmd_logs
       ;;
     test)
       cmd_test
@@ -344,7 +842,7 @@ main() {
       usage
       ;;
     *)
-      error "Unknown command: $command"
+      error "watcher_usage_error" "Unknown command: $command"
       usage
       exit 1
       ;;
