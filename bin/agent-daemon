@@ -659,6 +659,13 @@ trigger_next_phase() {
       ;;
     doc-gardener)
       success "task_complete" "Task $task_id fully completed 🎉"
+      # Cleanup worktree after full task completion
+      local worktree_bin
+      worktree_bin="$(dirname "$0")/agent-worktree"
+      if [[ -x "$worktree_bin" ]]; then
+        info "phase_cleanup" "Destroying worktree for $task_id..."
+        "$worktree_bin" destroy "$task_id" 2>/dev/null || true
+      fi
       ;;
   esac
 }

@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# agent-worktree - Git worktree isolation for agent tasks
+# Each task gets its own worktree so agents work in parallel without conflicts
+
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+WORKTREES_DIR="$PROJECT_ROOT/.agent-worktrees"
+AGENT_DIR="$PROJECT_ROOT/.agent-swarm"
+
+info()    { echo -e "\033[0;34mℹ\033[0m $*"; }
+success() { echo -e "\033[0;32m✓\033[0m $*"; }
+warn()    { echo -e "\033[1;33m⚠\033[0m $*"; }
+error()   { echo -e "\033[0;31m✗\033[0m $*"; }
+
+usage() {
+  cat << EOF
+agent-worktree - Git worktree isolation for agent tasks
+
+Usage: agent-worktree <command> [args]
+
+Commands:
+  create <task-id>        Create isolated worktree for a task
+  destroy <task-id>       Remove worktree after task completes
+  list                    List all active worktrees
+  path <task-id>          Print worktree path (for use in scripts)
+  status <task-id>        Show worktree status
+
+How it works:
+  Each task gets a branch (agent/task-id) and a worktree at
+  .agent-worktrees/task-id/. Agents work there in isolation.
+  When done, they open a PR from agent/task-id → main.
+  After merge, the worktree is destroyed.
+
+EOF
+}
+
+# Ensure we're in a git repo
+check_git() {
+  if ! git -C "$PROJECT_ROOT" rev-parse --git-dir &>/dev/null; then
+    error "Not a git repository: $PROJECT_ROOT"
+    exit 1
+  fi
+}
+
+# Create worktree for a task
+cmd_create() {
+  local task_id="${1:-}"
+  if [[ -z "$task_id" ]]; then
+    error "Usage: agent-worktree create <task-id>"
+    exit 1
+  fi
+
+  check_git
+
+  local branch="agent/$task_id"
+  local worktree_path="$WORKTREES_DIR/$task_id"
+
+  # Already exists?
+  if [[ -d "$worktree_path" ]]; then
+    warn "Worktree already exists: $worktree_path"
+    echo "$worktree_path"
+    return 0
+  fi
+
+  mkdir -p "$WORKTREES_DIR"
+
+  # Create branch from current HEAD
+  info "Creating branch $branch..."
+  git -C "$PROJECT_ROOT" branch "$branch" HEAD 2>/dev/null || {
+    warn "Branch $branch already exists, reusing"
+  }
+
+  # Add worktree
+  info "Adding worktree at $worktree_path..."
+  git -C "$PROJECT_ROOT" worktree add "$worktree_path" "$branch"
+
+  # Write task metadata into worktree
+  local meta_file="$worktree_path/.agent-swarm/worktree-meta.json"
+  mkdir -p "$(dirname "$meta_file")"
+  jq -cn \
+    --arg task_id "$task_id" \
+    --arg branch "$branch" \
+    --arg path "$worktree_path" \
+    --arg created_at "$(date -Iseconds)" \
+    '{task_id: $task_id, branch: $branch, path: $path, created_at: $created_at, status: "active"}' \
+    > "$meta_file"
+
+  success "Worktree ready: $worktree_path (branch: $branch)"
+  echo "$worktree_path"
+}
+
+# Destroy worktree after task completes
+cmd_destroy() {
+  local task_id="${1:-}"
+  if [[ -z "$task_id" ]]; then
+    error "Usage: agent-worktree destroy <task-id>"
+    exit 1
+  fi
+
+  check_git
+
+  local branch="agent/$task_id"
+  local worktree_path="$WORKTREES_DIR/$task_id"
+
+  if [[ ! -d "$worktree_path" ]]; then
+    warn "Worktree not found: $worktree_path"
+    return 0
+  fi
+
+  info "Removing worktree $worktree_path..."
+  git -C "$PROJECT_ROOT" worktree remove "$worktree_path" --force 2>/dev/null || {
+    # Fallback: manual cleanup
+    rm -rf "$worktree_path"
+    git -C "$PROJECT_ROOT" worktree prune
+  }
+
+  # Delete branch if merged
+  if git -C "$PROJECT_ROOT" branch --merged main 2>/dev/null | grep -q "$branch"; then
+    info "Deleting merged branch $branch..."
+    git -C "$PROJECT_ROOT" branch -d "$branch" 2>/dev/null || true
+  else
+    warn "Branch $branch not yet merged — keeping it"
+  fi
+
+  success "Worktree destroyed: $task_id"
+}
+
+# List all active worktrees
+cmd_list() {
+  check_git
+
+  echo "Active agent worktrees:"
+  echo ""
+
+  if [[ ! -d "$WORKTREES_DIR" ]]; then
+    info "No worktrees yet"
+    return 0
+  fi
+
+  local found=0
+  for meta in "$WORKTREES_DIR"/*/".agent-swarm/worktree-meta.json"; do
+    [[ -f "$meta" ]] || continue
+    found=1
+    local task_id branch path created_at status
+    task_id=$(jq -r '.task_id' "$meta")
+    branch=$(jq -r '.branch' "$meta")
+    path=$(jq -r '.path' "$meta")
+    created_at=$(jq -r '.created_at' "$meta")
+    status=$(jq -r '.status' "$meta")
+    echo "  $task_id"
+    echo "    branch:  $branch"
+    echo "    path:    $path"
+    echo "    created: $created_at"
+    echo "    status:  $status"
+    echo ""
+  done
+
+  if [[ $found -eq 0 ]]; then
+    info "No active worktrees"
+  fi
+
+  # Also show git's view
+  echo "Git worktree list:"
+  git -C "$PROJECT_ROOT" worktree list
+}
+
+# Print worktree path (for use in scripts)
+cmd_path() {
+  local task_id="${1:-}"
+  if [[ -z "$task_id" ]]; then
+    error "Usage: agent-worktree path <task-id>"
+    exit 1
+  fi
+
+  local worktree_path="$WORKTREES_DIR/$task_id"
+  if [[ ! -d "$worktree_path" ]]; then
+    error "Worktree not found for task: $task_id"
+    exit 1
+  fi
+
+  echo "$worktree_path"
+}
+
+# Show worktree status
+cmd_status() {
+  local task_id="${1:-}"
+  if [[ -z "$task_id" ]]; then
+    error "Usage: agent-worktree status <task-id>"
+    exit 1
+  fi
+
+  local worktree_path="$WORKTREES_DIR/$task_id"
+  local meta_file="$worktree_path/.agent-swarm/worktree-meta.json"
+
+  if [[ ! -d "$worktree_path" ]]; then
+    error "Worktree not found: $task_id"
+    exit 1
+  fi
+
+  echo "Worktree: $task_id"
+  echo "Path:     $worktree_path"
+
+  if [[ -f "$meta_file" ]]; then
+    echo "Branch:   $(jq -r '.branch' "$meta_file")"
+    echo "Created:  $(jq -r '.created_at' "$meta_file")"
+    echo "Status:   $(jq -r '.status' "$meta_file")"
+  fi
+
+  echo ""
+  echo "Git status:"
+  git -C "$worktree_path" status --short
+}
+
+# Main
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    create)  cmd_create "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    list)    cmd_list ;;
+    path)    cmd_path "$@" ;;
+    status)  cmd_status "$@" ;;
+    -h|--help|help) usage ;;
+    *)
+      error "Unknown command: $cmd"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

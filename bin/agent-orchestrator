@@ -281,6 +281,15 @@ When done, your final message should be: DOC_COMPLETE"
   
   # Spawn using available AI CLI
   local agent_script="$AGENT_DIR/sessions/${task_id}-${role}.sh"
+
+  # Create isolated worktree for this task (if not already exists)
+  local worktree_path
+  local worktree_bin="$(dirname "$0")/agent-worktree"
+  if [[ -x "$worktree_bin" ]]; then
+    worktree_path="$("$worktree_bin" create "$task_id" 2>/dev/null || echo "$PROJECT_ROOT")"
+  else
+    worktree_path="$PROJECT_ROOT"
+  fi
   
   # Detect available AI CLI
   local ai_cli=""
@@ -288,13 +297,13 @@ When done, your final message should be: DOC_COMPLETE"
   
   if command -v openclaw &> /dev/null; then
     ai_cli="openclaw"
-    ai_command="openclaw chat --cwd '$PROJECT_ROOT'"
+    ai_command="openclaw chat --cwd '$worktree_path'"
   elif command -v codex &> /dev/null; then
     ai_cli="codex"
-    ai_command="codex --cwd '$PROJECT_ROOT'"
+    ai_command="codex --cwd '$worktree_path'"
   elif command -v claude &> /dev/null; then
     ai_cli="claude"
-    ai_command="claude --cwd '$PROJECT_ROOT'"
+    ai_command="claude --cwd '$worktree_path'"
   else
     ai_cli="manual"
     ai_command="# No AI CLI detected - execute manually"
@@ -306,8 +315,9 @@ When done, your final message should be: DOC_COMPLETE"
 # Task: $task_id
 # Generated: $(date -Iseconds)
 # AI CLI: $ai_cli
+# Worktree: $worktree_path
 
-cd "$PROJECT_ROOT"
+cd "$worktree_path"
 
 echo "🤖 $role Agent starting..."
 echo "Task ID: $task_id"
@@ -329,15 +339,15 @@ echo ""
 case "$ai_cli" in
   openclaw)
     echo "Executing with OpenClaw..."
-    openclaw chat --cwd "$PROJECT_ROOT" --task "\$AGENT_PROMPT"
+    openclaw chat --cwd "$worktree_path" --task "\$AGENT_PROMPT"
     ;;
   codex)
     echo "Executing with Codex..."
-    codex --cwd "$PROJECT_ROOT" "\$AGENT_PROMPT"
+    codex --cwd "$worktree_path" "\$AGENT_PROMPT"
     ;;
   claude)
     echo "Executing with Claude Code..."
-    claude --cwd "$PROJECT_ROOT" "\$AGENT_PROMPT"
+    claude --cwd "$worktree_path" "\$AGENT_PROMPT"
     ;;
   manual)
     echo "No AI CLI detected. Please execute the instructions above manually."
