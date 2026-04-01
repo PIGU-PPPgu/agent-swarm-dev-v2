@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# plan-update - Append-only updates to execution plan files
+# Agents use this to log progress and decisions without overwriting
+
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+PLANS_DIR="$PROJECT_ROOT/plans"
+
+info()    { echo -e "\033[0;34mℹ\033[0m $*"; }
+success() { echo -e "\033[0;32m✓\033[0m $*"; }
+error()   { echo -e "\033[0;31m✗\033[0m $*"; }
+
+usage() {
+  cat << EOF
+plan-update - Append-only updates to execution plan files
+
+Usage: plan-update <command> <task-id> [args]
+
+Commands:
+  log <task-id> <message>              Append to Progress Log
+  decision <task-id> <decision> <rationale> [made-by]
+                                       Append to Decision Log
+  phase <task-id> <1|2|3|4> done      Mark a phase as complete
+  pr <task-id> <pr-number> <pr-url>   Set PR information
+  status <task-id> <status>           Update task status
+  agent <task-id> <role> <status>     Update agent assignment status
+  show <task-id>                      Print current plan
+
+Examples:
+  plan-update log task-xxx "Design doc created at docs/design-docs/task-xxx.md"
+  plan-update decision task-xxx "Use JWT for auth" "Stateless, scales better" "design-agent"
+  plan-update phase task-xxx 1 done
+  plan-update pr task-xxx 42 "https://github.com/org/repo/pull/42"
+  plan-update agent task-xxx builder running
+
+EOF
+}
+
+# Find plan file for task
+find_plan() {
+  local task_id="$1"
+  local plan_file
+
+  for dir in active in-progress completed; do
+    plan_file="$PLANS_DIR/$dir/${task_id}.md"
+    if [[ -f "$plan_file" ]]; then
+      echo "$plan_file"
+      return 0
+    fi
+  done
+
+  error "Plan not found for task: $task_id"
+  return 1
+}
+
+# Append to Progress Log section
+cmd_log() {
+  local task_id="${1:-}"
+  local message="${2:-}"
+  if [[ -z "$task_id" || -z "$message" ]]; then
+    error "Usage: plan-update log <task-id> <message>"
+    exit 1
+  fi
+
+  local plan_file
+  plan_file="$(find_plan "$task_id")"
+
+  local entry="$(date -Iseconds) [${AGENT_ROLE:-agent}] $message"
+
+  # Insert before closing ``` of Progress Log block
+  # Uses a temp file for atomic update
+  local tmp="$plan_file.$$.tmp"
+  awk -v entry="$entry" '
+    /^\`\`\`$/ && in_log { print entry; in_log=0 }
+    /^## Progress Log/ { in_log=1 }
+    { print }
+  ' "$plan_file" > "$tmp" && mv "$tmp" "$plan_file"
+
+  success "Progress logged: $entry"
+}
+
+# Append to Decision Log table
+cmd_decision() {
+  local task_id="${1:-}"
+  local decision="${2:-}"
+  local rationale="${3:-}"
+  local made_by="${4:-${AGENT_ROLE:-agent}}"
+
+  if [[ -z "$task_id" || -z "$decision" || -z "$rationale" ]]; then
+    error "Usage: plan-update decision <task-id> <decision> <rationale> [made-by]"
+    exit 1
+  fi
+
+  local plan_file
+  plan_file="$(find_plan "$task_id")"
+
+  local date_str
+  date_str="$(date +%Y-%m-%d)"
+
+  # Replace the placeholder row or append a new row before the italic note
+  local tmp="$plan_file.$$.tmp"
+  awk -v date="$date_str" -v dec="$decision" -v rat="$rationale" -v by="$made_by" '
+    /^\| — \| — \| — \| — \|/ { next }  # remove placeholder row
+    /^\*For significant decisions/ { print "| " date " | " dec " | " rat " | " by " |"; print; next }
+    { print }
+  ' "$plan_file" > "$tmp" && mv "$tmp" "$plan_file"
+
+  success "Decision logged: $decision"
+}
+
+# Mark a phase as complete
+cmd_phase() {
+  local task_id="${1:-}"
+  local phase="${2:-}"
+  local action="${3:-done}"
+
+  if [[ -z "$task_id" || -z "$phase" ]]; then
+    error "Usage: plan-update phase <task-id> <1|2|3|4> done"
+    exit 1
+  fi
+
+  local plan_file
+  plan_file="$(find_plan "$task_id")"
+
+  local phase_label
+  case "$phase" in
+    1) phase_label="Phase 1" ;;
+    2) phase_label="Phase 2" ;;
+    3) phase_label="Phase 3" ;;
+    4) phase_label="Phase 4" ;;
+    *) error "Phase must be 1-4"; exit 1 ;;
+  esac
+
+  local tmp="$plan_file.$$.tmp"
+  sed "s/- \[ \] $phase_label/- [x] $phase_label/" "$plan_file" > "$tmp" && mv "$tmp" "$plan_file"
+
+  success "Phase $phase marked complete"
+
+  # Also log it
+  cmd_log "$task_id" "Phase $phase completed"
+}
+
+# Set PR information
+cmd_pr() {
+  local task_id="${1:-}"
+  local pr_number="${2:-}"
+  local pr_url="${3:-}"
+
+  if [[ -z "$task_id" || -z "$pr_number" ]]; then
+    error "Usage: plan-update pr <task-id> <pr-number> <pr-url>"
+    exit 1
+  fi
+
+  local plan_file
+  plan_file="$(find_plan "$task_id")"
+
+  local tmp="$plan_file.$$.tmp"
+  sed \
+    -e "s/\*\*Number:\*\* TBD/**Number:** #$pr_number/" \
+    -e "s|\*\*URL:\*\* TBD|**URL:** $pr_url|" \
+    "$plan_file" > "$tmp" && mv "$tmp" "$plan_file"
+
+  success "PR set: #$pr_number"
+  cmd_log "$task_id" "PR opened: #$pr_number $pr_url"
+}
+
+# Update task status
+cmd_status() {
+  local task_id="${1:-}"
+  local new_status="${2:-}"
+
+  if [[ -z "$task_id" || -z "$new_status" ]]; then
+    error "Usage: plan-update status <task-id> <status>"
+    exit 1
+  fi
+
+  local plan_file
+  plan_file="$(find_plan "$task_id")"
+
+  local tmp="$plan_file.$$.tmp"
+  sed "s/\*\*Status:\*\* .*/\*\*Status:\*\* $new_status/" "$plan_file" > "$tmp" && mv "$tmp" "$plan_file"
+
+  success "Status updated: $new_status"
+}
+
+# Update agent assignment
+cmd_agent() {
+  local task_id="${1:-}"
+  local role="${2:-}"
+  local status="${3:-}"
+
+  if [[ -z "$task_id" || -z "$role" || -z "$status" ]]; then
+    error "Usage: plan-update agent <task-id> <role> <status>"
+    exit 1
+  fi
+
+  local plan_file
+  plan_file="$(find_plan "$task_id")"
+
+  local date_str
+  date_str="$(date +%Y-%m-%dT%H:%M:%S)"
+
+  local tmp="$plan_file.$$.tmp"
+  # Update the table row for this role
+  awk -v role="$role" -v status="$status" -v ts="$date_str" '
+    $0 ~ "^| " role " |" {
+      if (status == "running")
+        print "| " role " | " status " | " ts " | — |"
+      else if (status == "completed")
+        print "| " role " | " status " | — | " ts " |"
+      else
+        print "| " role " | " status " | — | — |"
+      next
+    }
+    { print }
+  ' "$plan_file" > "$tmp" && mv "$tmp" "$plan_file"
+
+  success "Agent $role status: $status"
+}
+
+# Print current plan
+cmd_show() {
+  local task_id="${1:-}"
+  if [[ -z "$task_id" ]]; then
+    error "Usage: plan-update show <task-id>"
+    exit 1
+  fi
+
+  local plan_file
+  plan_file="$(find_plan "$task_id")"
+  cat "$plan_file"
+}
+
+# Main
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    log)      cmd_log "$@" ;;
+    decision) cmd_decision "$@" ;;
+    phase)    cmd_phase "$@" ;;
+    pr)       cmd_pr "$@" ;;
+    status)   cmd_status "$@" ;;
+    agent)    cmd_agent "$@" ;;
+    show)     cmd_show "$@" ;;
+    -h|--help|help) usage ;;
+    *)
+      error "Unknown command: $cmd"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

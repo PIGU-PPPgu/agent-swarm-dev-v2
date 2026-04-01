@@ -87,6 +87,11 @@ harness enforce        # Check architecture violations
 harness golden-rules   # Check golden rule violations
 harness garden         # Find stale docs
 agent-orchestrator     # Spawn and manage agents
+agent-worktree         # Manage isolated worktrees per task
+plan-update log        # Append to task progress log
+plan-update decision   # Record a decision in the task log
+plan-update phase      # Mark a phase complete
+plan-update pr         # Set PR number on task plan
 gh pr create           # Open a PR
 gh pr review           # Review a PR
 ```

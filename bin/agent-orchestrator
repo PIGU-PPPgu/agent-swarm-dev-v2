@@ -92,58 +92,69 @@ create_execution_plan() {
 **ID:** $task_id
 **Status:** active
 **Created:** $(date -Iseconds)
-**Owner:** orchestrator
+**Worktree:** .agent-worktrees/${task_id}/
 
 ## Goal
+
 $task
 
-## Execution Steps
+## Success Criteria
 
-### Phase 1: Design
-- [ ] Analyze requirements
-- [ ] Create design document (docs/design-docs/${task_id}.md)
-- [ ] Define architecture impact
+- [ ] Core functionality implemented and tested
+- [ ] harness audit score >= 80
+- [ ] harness enforce --check passes
+- [ ] Documentation updated
 
-### Phase 2: Implementation
-- [ ] Implement core functionality
-- [ ] Write unit tests
-- [ ] Run quality checks (/harness enforce --check)
-- [ ] Open PR
+## Phases
 
-### Phase 3: Review
-- [ ] Self-review
-- [ ] Request agent reviews (security, performance)
-- [ ] Address feedback
-- [ ] Re-run quality checks
-
-### Phase 4: Integration
-- [ ] Merge PR
-- [ ] Update documentation
-- [ ] Run /harness garden
-- [ ] Mark as complete
+- [ ] Phase 1: Design — analyze requirements, create design doc
+- [ ] Phase 2: Implementation — code + tests + open PR
+- [ ] Phase 3: Review — review passes, CI green
+- [ ] Phase 4: Documentation — docs updated, plan archived
 
 ## Agent Assignments
-- **Design Agent:** Pending
-- **Builder Agent:** Pending
-- **Reviewer Agent:** Pending
-- **Doc Agent:** Pending
+
+| Role | Status | Started | Completed |
+|------|--------|---------|-----------|
+| design | pending | — | — |
+| builder | pending | — | — |
+| reviewer | pending | — | — |
+| doc-gardener | pending | — | — |
+
+## PR
+
+- **Number:** TBD
+- **URL:** TBD
+- **Branch:** agent/${task_id}
+
+## Decision Log
+
+| Date | Decision | Rationale | Made By |
+|------|----------|-----------|---------|
+| — | Initial task created | User request | orchestrator |
+
+*For significant decisions, create: docs/decisions/$(date +%Y-%m-%d)-short-title.md*
 
 ## Progress Log
-- $(date -Iseconds): Task created by orchestrator
 
-## Decisions
-(To be filled by agents)
+\`\`\`
+$(date -Iseconds) [orchestrator] Task created
+\`\`\`
 
-## PR Information
-- **PR Number:** TBD
-- **PR URL:** TBD
+*Append-only. Never edit existing entries.*
 
 ## Blockers
-None
+
+- None
+
+## Context
+
+- **Design doc:** docs/design-docs/${task_id}.md (created by design agent)
+- **Architecture impact:** TBD
+- **Related tasks:** None
 
 ---
-*This plan is managed by the agent orchestrator*
-*Agents: Update this file as you make progress*
+*Agents: append to Progress Log and Decision Log as you work. Never overwrite.*
 EOF
   
   success "Execution plan created: $plan_file"
